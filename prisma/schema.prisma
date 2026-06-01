@@ -1,0 +1,133 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Project {
+  id           String              @id @default(cuid())
+  name         String
+  idea         String
+  industry     String
+  targetUser   String
+  needFinancialSuitabilityCheck Boolean @default(false)
+  needContinuousCompetitorMonitoring Boolean @default(false)
+  preferredTechStack String?
+  status       String              @default("draft")
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  researchRuns ResearchRun[]
+  competitors  Competitor[]
+  evaluations  Evaluation[]
+  artifacts    GeneratedArtifact[]
+  monitorJobs  MonitorJob[]
+  reports      MonitorReport[]
+}
+
+model ResearchRun {
+  id               String    @id @default(cuid())
+  projectId        String
+  hermesRunId      String?
+  mode             String
+  status           String    @default("queued")
+  inputPrompt      String
+  rawOutput        String?
+  parsedOutputJson String?
+  createdAt        DateTime  @default(now())
+  completedAt      DateTime?
+
+  project          Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+model Competitor {
+  id                String   @id @default(cuid())
+  projectId         String
+  name              String
+  type              String
+  url               String
+  description       String
+  coreFeaturesJson  String
+  strengthsJson     String
+  weaknessesJson    String
+  reusableIdeasJson String
+  threatLevel       Int
+  reuseStrategy     String
+  createdAt         DateTime @default(now())
+
+  project           Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+model Evaluation {
+  id                   String   @id @default(cuid())
+  projectId            String
+  pdrs                 Float
+  opportunityScore     Int
+  competitiveScore     Int
+  specificationScore   Int
+  prototypeScore       Int
+  promptReadinessScore Int
+  redundancyRisk       Int
+  differentiationScore Int
+  decision             String
+  risksJson            String
+  nextActionsJson      String
+  scoreReasonsJson     String              @default("{}")
+  createdAt            DateTime @default(now())
+
+  project              Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+model GeneratedArtifact {
+  id           String   @id @default(cuid())
+  projectId    String
+  artifactType String
+  content      String
+  version      Int      @default(1)
+  createdAt    DateTime @default(now())
+
+  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, artifactType])
+}
+
+model MonitorJob {
+  id              String          @id @default(cuid())
+  projectId       String
+  hermesCronJobId String?
+  schedule        String
+  status          String          @default("active")
+  lastRunAt       DateTime?
+  nextRunAt       DateTime?
+  createdAt       DateTime        @default(now())
+
+  project         Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  reports         MonitorReport[]
+
+  @@index([projectId])
+}
+
+model MonitorReport {
+  id                        String     @id @default(cuid())
+  projectId                 String
+  jobId                     String
+  differentiationDriftScore Int
+  summary                   String
+  alertsJson                String
+  recommendedActionsJson    String
+  createdAt                 DateTime   @default(now())
+
+  project                   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  job                       MonitorJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, jobId])
+}
