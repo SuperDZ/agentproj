@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body { @apply bg-slate-950 text-slate-100 antialiased; }
+a { @apply text-blue-300 hover:text-blue-200; }
+.prose h1, .prose h2, .prose h3 { @apply text-slate-100; }
+.prose p, .prose li { @apply text-slate-300; }
+.prose strong { @apply text-white; }
