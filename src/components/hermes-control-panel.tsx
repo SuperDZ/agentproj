@@ -79,9 +79,9 @@ export function HermesControlPanel({ recommended, policies }: HermesControlPanel
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action })
     });
-    const payload = await response.json();
+    const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
-      setMessage(payload.error || "Hermes 状态更新失败。");
+      setMessage(payload.error ? `Hermes 状态更新失败：${payload.error}` : "Hermes 状态更新失败。");
       return;
     }
     setStatus(payload);

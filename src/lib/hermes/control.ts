@@ -183,16 +183,89 @@ export async function saveModelConfig(config: { provider: string; model: string;
   return getHermesStatus();
 }
 
+function formatHermesStartupError(message: string, details: { stderr?: string; code?: number | null; signal?: NodeJS.Signals | null }) {
+  const stderr = details.stderr?.trim();
+  const exitDetail = details.code !== undefined || details.signal
+    ? ` Exit code: ${details.code ?? "none"}${details.signal ? `, signal: ${details.signal}` : ""}.`
+    : "";
+  const stderrDetail = stderr ? ` Stderr: ${stderr}` : "";
+  return new Error(`${message}${exitDetail}${stderrDetail}`);
+}
+
 export async function startHermesDashboard() {
+  const root = hermesRoot();
+  const python = hermesPython();
+
+  try {
+    const rootStat = await fs.stat(root);
+    if (!rootStat.isDirectory()) {
+      throw new Error(`Hermes root is not a directory: ${root}`);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Hermes root is not a directory")) throw error;
+    throw new Error(`Hermes root does not exist or is not accessible: ${root}`);
+  }
+
+  if (!executableExistsSync(python)) {
+    throw new Error(`Hermes Python executable is not executable or cannot be resolved: ${python}`);
+  }
+
   await fs.mkdir(stateDir, { recursive: true });
-  const child = spawn(hermesPython(), ["-m", "hermes_cli.main", "dashboard"], {
-    cwd: hermesRoot(),
+
+  const child = spawn(python, ["-m", "hermes_cli.main", "dashboard"], {
+    cwd: root,
     detached: true,
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe"],
     windowsHide: true
   });
+
+  let stderr = "";
+  const maxStartupStderrLength = 16 * 1024;
+  const appendStderr = (chunk: Buffer | string) => {
+    stderr = `${stderr}${chunk.toString()}`.slice(-maxStartupStderrLength);
+  };
+  child.stderr?.on("data", appendStderr);
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const startupWindowMs = 750;
+    let timer: NodeJS.Timeout | undefined;
+
+    const settle = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      child.off("error", onError);
+      child.off("close", onClose);
+      callback();
+    };
+
+    const onError = (error: Error) => {
+      child.stderr?.off("data", appendStderr);
+      settle(() => reject(formatHermesStartupError(`Failed to start Hermes dashboard: ${error.message}`, { stderr })));
+    };
+
+    const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
+      child.stderr?.off("data", appendStderr);
+      settle(() => reject(formatHermesStartupError("Hermes dashboard exited during startup.", { stderr, code, signal })));
+    };
+
+    child.once("error", onError);
+    child.once("close", onClose);
+    timer = setTimeout(() => {
+      settle(() => resolve());
+    }, startupWindowMs);
+  });
+
+  const stderrPipe = child.stderr as (NodeJS.ReadableStream & { unref?: () => void }) | null;
+  stderrPipe?.unref?.();
+
+  if (!child.pid) {
+    throw new Error("Hermes dashboard started without a process id; pid file was not written.");
+  }
+
   child.unref();
-  await fs.writeFile(pidFile, String(child.pid ?? ""), "utf8");
+  await fs.writeFile(pidFile, String(child.pid), "utf8");
   return getHermesStatus();
 }
 
