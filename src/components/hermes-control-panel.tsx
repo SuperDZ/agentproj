@@ -31,6 +31,8 @@ type StatusPayload = {
   mode?: string;
   localRoot?: string;
   localPython?: string;
+  pythonExists?: boolean;
+  pythonDiagnostics?: string;
   provider?: string;
   model?: string;
   usageMode?: string;
@@ -206,6 +208,7 @@ export function HermesControlPanel({ recommended, policies }: HermesControlPanel
           <Info label="模式" value={status.mode || "未配置"} />
           <Info label="根目录" value={status.localRoot || "未配置"} />
           <Info label="Python" value={status.localPython || "未配置"} />
+          <Info label="Python 状态" value={status.pythonExists === undefined ? "未知" : status.pythonExists ? "可用" : "未找到"} />
           <Info label="Dashboard PID" value={status.dashboardPid ? String(status.dashboardPid) : "未运行"} />
         </dl>
 
@@ -221,6 +224,9 @@ export function HermesControlPanel({ recommended, policies }: HermesControlPanel
             <button className="rounded-md bg-zinc-950 px-3 py-2 text-sm font-semibold text-white">保存</button>
           </div>
         </form>
+        {status.pythonExists === false && status.pythonDiagnostics && (
+          <p className="rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-800">{status.pythonDiagnostics}</p>
+        )}
         {message && <p className="rounded-md border border-blue-100 bg-blue-50 p-2 text-xs text-blue-700">{message}</p>}
       </div>
 

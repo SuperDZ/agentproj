@@ -27,6 +27,7 @@ describe("Hermes local adapter", () => {
     vi.resetModules();
     process.env.HERMES_MODE = "local";
     process.env.HERMES_LOCAL_ROOT = "hermes-agent";
+    process.env.HERMES_LOCAL_PYTHON = "py";
     process.env.HERMES_INFERENCE_PROVIDER = "alibaba";
     process.env.HERMES_INFERENCE_MODEL = "qwen-plus";
     const output = createMockHermesOutput({ projectId: "p1", idea: "SpecFlow", industry: "devtools", targetUser: "PMs" });
@@ -54,6 +55,7 @@ describe("Hermes local adapter", () => {
 
   it("normalizes saved model config and reports the same local env fallbacks used by the runner", async () => {
     vi.resetModules();
+    process.env.HERMES_LOCAL_PYTHON = process.execPath;
     process.env.HERMES_LOCAL_PROVIDER = "local-provider";
     process.env.HERMES_LOCAL_MODEL = "local-model";
     process.env.HERMES_INFERENCE_PROVIDER = "inference-provider";
@@ -77,6 +79,9 @@ describe("Hermes local adapter", () => {
 
     await fs.rm(modelConfigPath, { force: true });
     await expect(getHermesStatus()).resolves.toMatchObject({
+      localPython: process.execPath,
+      pythonExists: true,
+      pythonSource: "HERMES_LOCAL_PYTHON",
       provider: "local-provider",
       model: "local-model"
     });
@@ -86,6 +91,7 @@ describe("Hermes local adapter", () => {
     vi.resetModules();
     process.env.HERMES_MODE = "local";
     process.env.HERMES_LOCAL_ROOT = "hermes-agent";
+    process.env.HERMES_LOCAL_PYTHON = process.execPath;
     process.env.HERMES_INFERENCE_PROVIDER = "env-provider";
     process.env.HERMES_INFERENCE_MODEL = "env-model";
 
@@ -120,6 +126,7 @@ describe("Hermes local adapter", () => {
   it("rejects unsupported saved Codex CLI mode before spawning local Hermes CLI", async () => {
     vi.resetModules();
     process.env.HERMES_MODE = "local";
+    process.env.HERMES_LOCAL_PYTHON = process.execPath;
 
     const { saveModelConfig } = await import("@/lib/hermes/control");
     await saveModelConfig({
@@ -142,6 +149,7 @@ describe("Hermes local adapter", () => {
   it("falls back to schema-valid research when local Hermes returns invalid JSON", async () => {
     vi.resetModules();
     process.env.HERMES_MODE = "local";
+    process.env.HERMES_LOCAL_PYTHON = process.execPath;
 
     vi.mocked(execFile).mockImplementation((command, args, options, callback) => {
       callback?.(null, "{ok:true}", "");
