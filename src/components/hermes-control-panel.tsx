@@ -100,8 +100,16 @@ export function HermesControlPanel({ recommended, policies }: HermesControlPanel
       })
     });
     const payload = await response.json();
+    if (!response.ok) {
+      setMessage(payload.error || "模型配置保存失败。");
+      return;
+    }
     setStatus(payload);
-    setMessage(response.ok ? "模型配置已保存。" : payload.error || "模型配置保存失败。");
+    if (payload.usageMode === "codex-cli") {
+      setMessage("模型配置已保存，但 Codex CLI 模式暂未接入本地 Hermes 运行时；切换为 API 后才会影响后续运行。");
+    } else {
+      setMessage("模型配置已保存并生效，将用于后续本地 Hermes 运行。");
+    }
   }
 
   async function search() {
