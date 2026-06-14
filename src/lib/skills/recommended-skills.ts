@@ -35,5 +35,33 @@ export const recommendedSkillSources: RecommendedSkillSource[] = [
     purpose: ["AI research", "technical research", "paper-oriented workflows"],
     usage: "Reference research workflow structure.",
     enabled: false
+  },
+  {
+    name: "excalidraw/excalidraw",
+    sourceType: "community-library",
+    purpose: ["prototype wireframes", "screen-flow diagrams", "interview storyboard"],
+    usage: "Reference fast whiteboard-style prototype patterns for the generated SVG and future interactive flows.",
+    enabled: false
+  },
+  {
+    name: "tldraw/tldraw",
+    sourceType: "community-library",
+    purpose: ["interactive canvas", "prototype editing", "visual collaboration"],
+    usage: "Reference React canvas interaction patterns if the prototype view becomes editable.",
+    enabled: false
+  },
+  {
+    name: "gitbrent/PptxGenJS",
+    sourceType: "community-library",
+    purpose: ["PowerPoint generation", "finance-style pitch deck export"],
+    usage: "Generate downloadable PPTX decks while keeping slide content auditable in markdown.",
+    enabled: true
+  },
+  {
+    name: "recharts/recharts",
+    sourceType: "community-library",
+    purpose: ["finance KPI charts", "risk dashboards", "decision metrics"],
+    usage: "Reference chart composition for future PDRS, risk, and competitor dashboard visuals.",
+    enabled: false
   }
 ];

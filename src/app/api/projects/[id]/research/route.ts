@@ -2,18 +2,12 @@ import { NextResponse } from "next/server";
 import { handleApiError } from "@/lib/api/errors";
 import { hermesClient } from "@/lib/hermes/client";
 import type { HermesEvent } from "@/lib/hermes/types";
-import { loadProjectFlowData, refreshLatestResearchRun, runProjectResearch } from "@/lib/services/project-flow";
+import { loadProjectFlowData, startProjectResearch } from "@/lib/services/project-flow";
 
-export async function GET(_: Request, { params }: { params: { id: string } }) {
+export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
-    let refreshError: string | undefined;
-    try {
-      await refreshLatestResearchRun(params.id);
-    } catch (error) {
-      refreshError = error instanceof Error ? error.message : "Unable to refresh Hermes run.";
-    }
-
-    const project = await loadProjectFlowData(params.id);
+    const { id } = await params;
+    const project = await loadProjectFlowData(id);
     const latestRun = project.researchRuns[0];
     if (!latestRun) return NextResponse.json({ status: "not_started", events: [] });
 
@@ -33,7 +27,6 @@ export async function GET(_: Request, { params }: { params: { id: string } }) {
       hasParsedOutput: Boolean(latestRun.parsedOutputJson),
       createdAt: latestRun.createdAt,
       completedAt: latestRun.completedAt,
-      refreshError,
       eventsError,
       events
     });
@@ -42,10 +35,20 @@ export async function GET(_: Request, { params }: { params: { id: string } }) {
   }
 }
 
-export async function POST(_: Request, { params }: { params: { id: string } }) {
+export async function POST(_: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const result = await runProjectResearch(params.id);
-    return NextResponse.json({ ok: true, status: result.status, hermesRunId: result.hermesRunId, hasParsedOutput: Boolean(result.parsedOutput) });
+    const { id } = await params;
+    const run = await startProjectResearch(id);
+    return NextResponse.json({
+      ok: true,
+      id: run.id,
+      status: run.status,
+      mode: run.mode,
+      hermesRunId: run.hermesRunId,
+      createdAt: run.createdAt,
+      completedAt: run.completedAt,
+      hasParsedOutput: Boolean(run.parsedOutputJson)
+    });
   } catch (error) {
     return handleApiError(error);
   }

@@ -2,8 +2,35 @@
 @tailwind components;
 @tailwind utilities;
 
-body { @apply bg-slate-950 text-slate-100 antialiased; }
-a { @apply text-blue-300 hover:text-blue-200; }
-.prose h1, .prose h2, .prose h3 { @apply text-slate-100; }
-.prose p, .prose li { @apply text-slate-300; }
-.prose strong { @apply text-white; }
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-zinc-50 text-zinc-950 antialiased;
+}
+
+a {
+  @apply text-blue-700 hover:text-blue-900;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+.prose h1,
+.prose h2,
+.prose h3 {
+  @apply text-zinc-950;
+}
+
+.prose p,
+.prose li {
+  @apply text-zinc-700;
+}
+
+.prose strong {
+  @apply text-zinc-950;
+}

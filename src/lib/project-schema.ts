@@ -5,18 +5,69 @@ export const booleanLike = z
   .optional()
   .transform((value) => value === true || value === "true" || value === "on");
 
-export const createProjectSchema = z.object({
-  name: z.string().trim().optional(),
-  idea: z.string().trim().min(1, "Product idea is required."),
-  industry: z.string().trim().min(1, "Industry is required.").default("general"),
-  targetUser: z.string().trim().min(1, "Target user is required.").default("product team"),
-  needFinancialSuitabilityCheck: booleanLike,
-  needContinuousCompetitorMonitoring: booleanLike,
-  preferredTechStack: z.string().trim().optional().nullable()
+export const monitorCadenceSchema = z.enum(["daily", "weekly", "monthly"]);
+
+export const monitorTaskConfigSchema = z.object({
+  task: z.string().trim().min(1),
+  startAt: z.string().trim().min(1),
+  cadence: monitorCadenceSchema
 });
+
+export const modelConfigSchema = z.object({
+  provider: z.enum(["deepseek", "qwen", "openai", "codex-cli", "custom"]).default("deepseek"),
+  model: z.string().trim().min(1).default("deepseek-chat"),
+  usageMode: z.enum(["api", "codex-cli"]).default("api"),
+  codexCliCommand: z.string().trim().optional().nullable()
+});
+
+function parseMonitorTaskConfigs(value: unknown) {
+  if (typeof value !== "string" || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return z.array(monitorTaskConfigSchema).parse(parsed);
+  } catch {
+    return [];
+  }
+}
+
+export const createProjectSchema = z
+  .object({
+    name: z.string().trim().optional(),
+    idea: z.string().trim().min(1, "Product idea is required."),
+    ideaExplanation: z.string().trim().optional().nullable(),
+    industry: z.string().trim().min(1, "Industry is required.").default("auto"),
+    targetUser: z.string().trim().min(1, "Target user is required.").default("auto"),
+    needFinancialSuitabilityCheck: booleanLike,
+    needContinuousCompetitorMonitoring: booleanLike,
+    preferredTechStack: z.string().trim().optional().nullable(),
+    monitorTasks: z.string().trim().optional().nullable(),
+    monitorTaskConfigs: z.unknown().transform(parseMonitorTaskConfigs),
+    problemDiscovery: z.string().trim().optional().nullable(),
+    requirementDefinition: z.string().trim().optional().nullable(),
+    coreFeatures: z.string().trim().optional().nullable(),
+    modelProvider: z.enum(["deepseek", "qwen", "openai", "codex-cli", "custom"]).default("deepseek"),
+    modelName: z.string().trim().optional().nullable(),
+    modelUsageMode: z.enum(["api", "codex-cli"]).default("api"),
+    codexCliCommand: z.string().trim().optional().nullable()
+  })
+  .transform((input) => ({
+    ...input,
+    needFinancialSuitabilityCheck: isFinancialIndustry(`${input.industry} ${input.idea} ${input.ideaExplanation ?? ""}`) && input.needFinancialSuitabilityCheck,
+    preferredTechStack: input.preferredTechStack || null,
+    modelConfig: modelConfigSchema.parse({
+      provider: input.modelProvider,
+      model: input.modelName || "deepseek-chat",
+      usageMode: input.modelUsageMode,
+      codexCliCommand: input.codexCliCommand
+    })
+  }));
 
 export type CreateProjectInput = z.infer<typeof createProjectSchema>;
 
 export function projectNameFromIdea(idea: string) {
-  return idea.split(/[，。,.]/)[0].slice(0, 48) || "Untitled SpecFlow Project";
+  return idea.split(/[,.，。；;!?！？]/)[0].trim().slice(0, 48) || "Untitled SpecFlow Project";
+}
+
+export function isFinancialIndustry(value: string) {
+  return /金融|证券|银行|保险|理财|财富|fintech|finance|financial|bank|wealth|insurance|securities/i.test(value);
 }

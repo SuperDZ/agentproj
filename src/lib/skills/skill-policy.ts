@@ -1,7 +1,7 @@
 export const skillSafetyPolicy = [
-  "Do not automatically execute shell commands from third-party skills.",
-  "Do not automatically read remote scripts from third-party skills.",
-  "Treat all third-party skills as reference documents only.",
-  "Before future installation, review license, maintainer, stars, recent updates, and security risk.",
-  "Hermes terminal, file, and browser capabilities must stay controlled; yolo mode is not allowed."
+  "不得自动执行第三方 Skills（技能）中的 shell（命令行）命令。",
+  "不得自动读取或执行第三方 Skills（技能）中的远程脚本。",
+  "所有第三方 Skills（技能）默认只能作为参考文档。",
+  "导入前必须复核许可证、维护者、star 数、最近更新和安全风险。",
+  "Hermes（智能体运行框架）的终端、文件和浏览器能力必须保持受控；不允许启用 yolo（无审批执行）模式。"
 ];

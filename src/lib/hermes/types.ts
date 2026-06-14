@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { EvaluationInput, EvaluationResult } from "@/lib/evaluation/engine";
 
 export const competitorSchema = z.object({
   name: z.string(),
@@ -24,7 +25,17 @@ export const hermesResearchOutputSchema = z.object({
     mvp_reframe: z.string(),
     must_have_features: z.array(z.string()),
     should_not_build_features: z.array(z.string()),
-    reuse_strategy: z.array(z.string())
+    reuse_strategy: z.array(z.string()),
+    score_basis: z.array(z.string()).optional(),
+    reasoning: z.string().optional(),
+    similar_products: z
+      .array(z.object({
+        name: z.string(),
+        same_points: z.array(z.string()),
+        modification_suggestions: z.array(z.string())
+      }))
+      .optional(),
+    modification_suggestions: z.array(z.string()).optional()
   }),
   prd: z.record(z.string(), z.unknown()),
   codex_pack_seed: z.record(z.string(), z.unknown()),
@@ -44,14 +55,39 @@ export type HermesCompetitor = z.infer<typeof competitorSchema>;
 export type CreateResearchRunInput = {
   projectId: string;
   idea: string;
+  explanation?: string;
   industry: string;
   targetUser: string;
   financialSuitability?: boolean;
   preferredTechStack?: string;
 };
 
+export type CreatePlanningRunInput = {
+  projectId: string;
+  idea: string;
+  explanation?: string;
+  industry: string;
+  targetUser: string;
+};
+
+export type HermesPlanningOutput = {
+  pmPlanningAdvice: string;
+  problemAndUsers: string;
+  coreFeatures: string[];
+};
+
+export type HermesEvaluationInput = EvaluationInput & {
+  projectId: string;
+  prd: string;
+  differentiation: unknown;
+  competitorMatrix: unknown[];
+  previousHermesResearch?: unknown;
+};
+
+export type HermesEvaluationOutput = EvaluationResult;
+
 export type HermesRunStatus = "queued" | "running" | "completed" | "failed" | "completed_without_output";
-export type HermesMode = "real" | "mock";
+export type HermesMode = "real" | "mock" | "local";
 
 export type HermesRunResult = {
   hermesRunId: string;
