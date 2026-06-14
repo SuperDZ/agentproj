@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { accessSync, constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type {
@@ -30,7 +31,72 @@ export function hermesRoot() {
 }
 
 export function hermesPython() {
-  return process.env.HERMES_LOCAL_PYTHON || path.join(hermesRoot(), ".venv", "Scripts", "python.exe");
+  const configuredPython = process.env.HERMES_LOCAL_PYTHON?.trim();
+  if (configuredPython) return configuredPython;
+
+  if (process.platform === "win32") {
+    return path.join(hermesRoot(), ".venv", "Scripts", "python.exe");
+  }
+
+  const virtualEnvPython = path.join(hermesRoot(), ".venv", "bin", "python");
+  if (executableExistsSync(virtualEnvPython)) return virtualEnvPython;
+  if (executableExistsSync("python3")) return "python3";
+  return "python";
+}
+
+function executablePathExists(file: string) {
+  try {
+    accessSync(file, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function windowsCommandCandidates(command: string) {
+  const extensions = (process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM")
+    .split(";")
+    .map((extension) => extension.trim())
+    .filter(Boolean);
+  return [command, ...extensions.map((extension) => `${command}${extension}`)];
+}
+
+function executableExistsSync(command: string) {
+  if (command.includes("/") || command.includes("\\") || path.isAbsolute(command)) {
+    return executablePathExists(command);
+  }
+
+  const pathEntries = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  const commandCandidates = process.platform === "win32" ? windowsCommandCandidates(command) : [command];
+  for (const entry of pathEntries) {
+    for (const candidate of commandCandidates) {
+      if (executablePathExists(path.join(entry, candidate))) return true;
+    }
+  }
+  return false;
+}
+
+export function hermesPythonDiagnostics() {
+  const localPython = hermesPython();
+  const pythonExists = executableExistsSync(localPython);
+  const configuredPython = process.env.HERMES_LOCAL_PYTHON?.trim();
+  const virtualEnvPython = process.platform === "win32"
+    ? path.join(hermesRoot(), ".venv", "Scripts", "python.exe")
+    : path.join(hermesRoot(), ".venv", "bin", "python");
+  const virtualEnvPythonExists = executableExistsSync(virtualEnvPython);
+  const fallbackCandidates = process.platform === "win32" ? [] : ["python3", "python"];
+
+  return {
+    localPython,
+    pythonExists,
+    pythonDiagnostics: pythonExists
+      ? "Python executable resolved successfully."
+      : `Python executable not found: ${localPython}. Set HERMES_LOCAL_PYTHON or create the Hermes virtual environment at ${virtualEnvPython}.`,
+    pythonSource: configuredPython ? "HERMES_LOCAL_PYTHON" : virtualEnvPythonExists ? "venv" : "fallback",
+    virtualEnvPython,
+    virtualEnvPythonExists,
+    fallbackCandidates
+  };
 }
 
 function whitelistFile() {
@@ -94,10 +160,11 @@ export async function getHermesStatus() {
   }
 
   const savedModelConfig = await readModelConfig();
+  const pythonDiagnostics = hermesPythonDiagnostics();
   return {
     mode: process.env.HERMES_MODE || "mock",
     localRoot: hermesRoot(),
-    localPython: hermesPython(),
+    ...pythonDiagnostics,
     provider: savedModelConfig.provider || process.env.HERMES_LOCAL_PROVIDER || process.env.HERMES_INFERENCE_PROVIDER || "",
     model: savedModelConfig.model || process.env.HERMES_LOCAL_MODEL || process.env.HERMES_INFERENCE_MODEL || "",
     usageMode: savedModelConfig.usageMode,

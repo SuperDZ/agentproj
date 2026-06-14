@@ -1,15 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { readModelConfig, type HermesModelConfig } from "./control";
+import { hermesPython, readModelConfig, type HermesModelConfig } from "./control";
 import { createMockHermesOutput } from "./mock";
 import { parseHermesResearchOutput } from "./parser";
 import type { CreatePlanningRunInput, CreateResearchRunInput, HermesPlanningOutput, HermesRunResult } from "./types";
 
 function localHermesRoot() {
   return process.env.HERMES_LOCAL_ROOT || "hermes-agent";
-}
-
-function localHermesPython() {
-  return process.env.HERMES_LOCAL_PYTHON || "py";
 }
 
 function localHermesTimeoutMs() {
@@ -106,7 +102,7 @@ function buildLocalPlanningPrompt(input: CreatePlanningRunInput) {
 async function runLocalHermesCli(prompt: string) {
   const { execFile } = await import("node:child_process");
   const root = localHermesRoot();
-  const command = localHermesPython();
+  const command = hermesPython();
   const args = ["-m", "hermes_cli.main"];
   const config = await readModelConfig();
   if (config.usageMode === "codex-cli") {
