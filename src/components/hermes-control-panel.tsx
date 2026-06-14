@@ -142,11 +142,15 @@ export function HermesControlPanel({ recommended, policies }: HermesControlPanel
 
   async function importSkill(item: SkillSearchResult) {
     if (!item.cloneUrl) return;
+    if (!item.whitelisted || item.safety.status !== "passed") {
+      setMessage("请先人工复核并加入白名单。");
+      return;
+    }
     setMessage("正在导入到本地 Hermes Skills（技能）库...");
     const response = await fetch("/api/hermes/skills/import", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ cloneUrl: item.cloneUrl, url: item.url, name: item.name })
+      body: JSON.stringify({ cloneUrl: item.cloneUrl, url: item.url, name: item.name, safetyStatus: item.safety.status })
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
@@ -261,10 +265,10 @@ export function HermesControlPanel({ recommended, policies }: HermesControlPanel
                 <button
                   type="button"
                   onClick={() => importSkill(item)}
-                  disabled={item.safety.status === "failed"}
+                  disabled={!item.whitelisted || item.safety.status !== "passed"}
                   className="rounded-md bg-zinc-950 px-3 py-2 text-xs font-semibold text-white hover:bg-zinc-800 disabled:cursor-not-allowed disabled:bg-zinc-300"
                 >
-                  导入
+                  {item.whitelisted && item.safety.status === "passed" ? "导入" : "先加入白名单"}
                 </button>
               </div>
             </div>

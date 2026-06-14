@@ -144,7 +144,7 @@ export async function removeSkillWhitelist(name: string) {
   return { removed: entries.length - next.length };
 }
 
-function sameWhitelistEntry(left: SkillWhitelistEntry, right: Pick<SkillWhitelistEntry, "name" | "url" | "cloneUrl">) {
+export function sameWhitelistEntry(left: SkillWhitelistEntry, right: Pick<SkillWhitelistEntry, "name" | "url" | "cloneUrl">) {
   return left.name === right.name || (!!left.url && left.url === right.url) || (!!left.cloneUrl && left.cloneUrl === right.cloneUrl);
 }
 
@@ -235,8 +235,20 @@ type ImportGithubSkillInput = {
   cloneUrl?: string;
   identifier?: string;
   name: string;
+  safetyStatus?: SkillSearchSafety["status"];
   url?: string;
 };
+
+export class SkillImportForbiddenError extends Error {
+  status = 403;
+
+  constructor(message = "该来源尚未通过白名单校验，请先人工复核并加入白名单。") {
+    super(message);
+    this.name = "SkillImportForbiddenError";
+  }
+}
+
+export type SkillImportSource = Pick<SkillWhitelistEntry, "name" | "url" | "cloneUrl">;
 
 function githubRepoFromUrl(value?: string) {
   if (!value) return undefined;
@@ -244,6 +256,38 @@ function githubRepoFromUrl(value?: string) {
   const match = normalized.match(/github\.com[:/]+([^/\s]+)\/([^/\s#?]+)/i);
   if (!match) return undefined;
   return `${match[1]}/${match[2]}`;
+}
+
+export function resolveSkillImportSource(input: ImportGithubSkillInput): SkillImportSource {
+  const name = input.name?.trim();
+  const url = input.url?.trim();
+  const cloneUrl = input.cloneUrl?.trim();
+  const identifier = input.identifier?.trim();
+
+  const repoFromIdentifier = githubRepoFromUrl(identifier);
+  const repoFromUrl = githubRepoFromUrl(url);
+  const repoFromClone = githubRepoFromUrl(cloneUrl);
+  const repo = repoFromUrl || repoFromClone || repoFromIdentifier || (identifier?.match(/^[^/\s]+\/[^/\s]+(?:\/[^\s]+)?$/) ? identifier.split("/").slice(0, 2).join("/") : undefined);
+
+  return {
+    name: repo || name,
+    url: url || (repo ? `https://github.com/${repo}` : identifier?.startsWith("http") ? identifier : undefined),
+    cloneUrl: cloneUrl || (repo ? `https://github.com/${repo}.git` : undefined)
+  };
+}
+
+export async function assertSkillImportWhitelisted(input: ImportGithubSkillInput) {
+  if (input.safetyStatus === "failed") {
+    throw new SkillImportForbiddenError("该来源未通过安全检查，请先人工复核并加入白名单。");
+  }
+
+  const source = resolveSkillImportSource(input);
+  if (!source.name) throw new Error("name is required.");
+  const whitelist = await readSkillWhitelist();
+  if (!isWhitelisted(source, whitelist)) {
+    throw new SkillImportForbiddenError();
+  }
+  return source;
 }
 
 function githubApiHeaders() {
@@ -288,6 +332,7 @@ async function installSkillWithHermes(input: ImportGithubSkillInput) {
 }
 
 export async function importGithubSkill(input: ImportGithubSkillInput) {
+  await assertSkillImportWhitelisted(input);
   return installSkillWithHermes(input);
 }
 
