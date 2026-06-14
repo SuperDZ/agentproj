@@ -15,6 +15,13 @@ const stateDir = path.join(process.cwd(), ".next", "hermes");
 const pidFile = path.join(stateDir, "dashboard.pid");
 const modelConfigFile = path.join(stateDir, "model-config.json");
 
+export type HermesModelConfig = {
+  provider: string;
+  model: string;
+  usageMode: "api" | "codex-cli";
+  codexCliCommand: string;
+};
+
 const officialReviewedSkillRepos = new Set(["NousResearch/hermes-agent", "Hermes bundled skills"]);
 const recommendedToolNames = new Set(["excalidraw/excalidraw", "tldraw/tldraw", "gitbrent/PptxGenJS", "recharts/recharts"]);
 
@@ -59,6 +66,24 @@ async function writeJsonFile(file: string, value: unknown) {
   await fs.writeFile(file, JSON.stringify(value, null, 2), "utf8");
 }
 
+function stringValue(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeUsageMode(value: unknown): HermesModelConfig["usageMode"] {
+  return value === "codex-cli" ? "codex-cli" : "api";
+}
+
+export async function readModelConfig(): Promise<HermesModelConfig> {
+  const savedModelConfig = await readJsonFile<Record<string, unknown>>(modelConfigFile, {});
+  return {
+    provider: stringValue(savedModelConfig.provider),
+    model: stringValue(savedModelConfig.model),
+    usageMode: normalizeUsageMode(savedModelConfig.usageMode),
+    codexCliCommand: stringValue(savedModelConfig.codexCliCommand) || "codex"
+  };
+}
+
 export async function getHermesStatus() {
   let dashboardPid: number | undefined;
   try {
@@ -68,21 +93,26 @@ export async function getHermesStatus() {
     dashboardPid = undefined;
   }
 
-  const savedModelConfig = await readJsonFile<Record<string, unknown>>(modelConfigFile, {});
+  const savedModelConfig = await readModelConfig();
   return {
     mode: process.env.HERMES_MODE || "mock",
     localRoot: hermesRoot(),
     localPython: hermesPython(),
-    provider: String(savedModelConfig.provider || process.env.HERMES_INFERENCE_PROVIDER || ""),
-    model: String(savedModelConfig.model || process.env.HERMES_INFERENCE_MODEL || ""),
-    usageMode: String(savedModelConfig.usageMode || "api"),
-    codexCliCommand: String(savedModelConfig.codexCliCommand || "codex"),
+    provider: savedModelConfig.provider || process.env.HERMES_LOCAL_PROVIDER || process.env.HERMES_INFERENCE_PROVIDER || "",
+    model: savedModelConfig.model || process.env.HERMES_LOCAL_MODEL || process.env.HERMES_INFERENCE_MODEL || "",
+    usageMode: savedModelConfig.usageMode,
+    codexCliCommand: savedModelConfig.codexCliCommand,
     dashboardPid
   };
 }
 
 export async function saveModelConfig(config: { provider: string; model: string; usageMode: string; codexCliCommand?: string }) {
-  await writeJsonFile(modelConfigFile, config);
+  await writeJsonFile(modelConfigFile, {
+    provider: stringValue(config.provider),
+    model: stringValue(config.model),
+    usageMode: normalizeUsageMode(config.usageMode),
+    codexCliCommand: stringValue(config.codexCliCommand) || "codex"
+  });
   return getHermesStatus();
 }
 

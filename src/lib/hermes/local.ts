@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readModelConfig, type HermesModelConfig } from "./control";
 import { createMockHermesOutput } from "./mock";
 import { parseHermesResearchOutput } from "./parser";
 import type { CreatePlanningRunInput, CreateResearchRunInput, HermesPlanningOutput, HermesRunResult } from "./types";
@@ -16,12 +17,12 @@ function localHermesTimeoutMs() {
   return Number.isFinite(value) && value > 0 ? value : 180_000;
 }
 
-function localHermesProvider() {
-  return process.env.HERMES_LOCAL_PROVIDER || process.env.HERMES_INFERENCE_PROVIDER;
+function localHermesProvider(config: HermesModelConfig) {
+  return config.provider || process.env.HERMES_LOCAL_PROVIDER || process.env.HERMES_INFERENCE_PROVIDER;
 }
 
-function localHermesModel() {
-  return process.env.HERMES_LOCAL_MODEL || process.env.HERMES_INFERENCE_MODEL;
+function localHermesModel(config: HermesModelConfig) {
+  return config.model || process.env.HERMES_LOCAL_MODEL || process.env.HERMES_INFERENCE_MODEL;
 }
 
 function withLocalPythonPath(root: string) {
@@ -107,8 +108,12 @@ async function runLocalHermesCli(prompt: string) {
   const root = localHermesRoot();
   const command = localHermesPython();
   const args = ["-m", "hermes_cli.main"];
-  const provider = localHermesProvider();
-  const model = localHermesModel();
+  const config = await readModelConfig();
+  if (config.usageMode === "codex-cli") {
+    throw new Error("Codex CLI usage mode is saved but is not supported by the local Hermes CLI runner. Switch usage mode to API to run local Hermes.");
+  }
+  const provider = localHermesProvider(config);
+  const model = localHermesModel(config);
   if (provider) args.push("--provider", provider);
   if (model) args.push("-m", model);
   args.push("-z", prompt, "--ignore-user-config", "--ignore-rules");
