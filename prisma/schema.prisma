@@ -1,0 +1,296 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Project {
+  id           String              @id @default(cuid())
+  name         String
+  idea         String
+  industry     String
+  targetUser   String
+  needFinancialSuitabilityCheck Boolean @default(false)
+  needContinuousCompetitorMonitoring Boolean @default(false)
+  preferredTechStack String?
+  status       String              @default("draft")
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  researchRuns ResearchRun[]
+  competitors  Competitor[]
+  evaluations  Evaluation[]
+  artifacts    GeneratedArtifact[]
+  storedArtifacts StoredArtifact[]
+  monitorJobs  MonitorJob[]
+  reports      MonitorReport[]
+  asyncTasks   AsyncTask[]
+  operationalEvents OperationalEvent[]
+  modelInvocations ModelInvocation[]
+}
+
+model ResearchRun {
+  id               String    @id @default(cuid())
+  projectId        String
+  hermesRunId      String?
+  mode             String
+  status           String    @default("queued")
+  inputPrompt      String
+  rawOutput        String?
+  parsedOutputJson String?
+  createdAt        DateTime  @default(now())
+  completedAt      DateTime?
+
+  project          Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+model Competitor {
+  id                String   @id @default(cuid())
+  projectId         String
+  name              String
+  type              String
+  url               String
+  description       String
+  coreFeaturesJson  String
+  strengthsJson     String
+  weaknessesJson    String
+  reusableIdeasJson String
+  threatLevel       Int
+  reuseStrategy     String
+  createdAt         DateTime @default(now())
+
+  project           Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+model Evaluation {
+  id                   String   @id @default(cuid())
+  projectId            String
+  pdrs                 Float
+  opportunityScore     Int
+  competitiveScore     Int
+  specificationScore   Int
+  prototypeScore       Int
+  promptReadinessScore Int
+  redundancyRisk       Int
+  differentiationScore Int
+  decision             String
+  risksJson            String
+  nextActionsJson      String
+  scoreReasonsJson     String              @default("{}")
+  createdAt            DateTime @default(now())
+
+  project              Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+model GeneratedArtifact {
+  id           String   @id @default(cuid())
+  projectId    String
+  artifactType String
+  content      String
+  version      Int      @default(1)
+  createdAt    DateTime @default(now())
+
+  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  storedArtifacts StoredArtifact[]
+
+  @@index([projectId, artifactType])
+}
+
+model AsyncTask {
+  id            String             @id @default(cuid())
+  type          String
+  projectId     String?
+  status        String             @default("queued")
+  payloadJson   String             @default("{}")
+  resultJson    String?
+  priority      Int                @default(0)
+  attemptCount  Int                @default(0)
+  maxAttempts   Int                @default(3)
+  runAfter      DateTime           @default(now())
+  lockedBy      String?
+  lockExpiresAt DateTime?
+  lastError     String?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+  completedAt   DateTime?
+
+  project       Project?           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  attempts      AsyncTaskAttempt[]
+  events        OperationalEvent[]
+  spans         TraceSpan[]
+
+  @@index([status, runAfter, priority, createdAt])
+  @@index([projectId, type, status])
+  @@index([lockedBy, lockExpiresAt])
+}
+
+model AsyncTaskAttempt {
+  id           String    @id @default(cuid())
+  taskId       String
+  workerId     String
+  status       String
+  startedAt    DateTime  @default(now())
+  endedAt      DateTime?
+  durationMs   Int?
+  error        String?
+  metadataJson String    @default("{}")
+
+  task         AsyncTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, startedAt])
+  @@index([workerId, startedAt])
+}
+
+model WorkerHeartbeat {
+  id           String   @id @default(cuid())
+  workerId     String   @unique
+  hostname     String
+  pid          Int
+  status       String   @default("running")
+  lastSeenAt   DateTime @default(now())
+  metadataJson String   @default("{}")
+
+  @@index([status, lastSeenAt])
+}
+
+model OperationalEvent {
+  id           String    @id @default(cuid())
+  level        String
+  source       String
+  eventType    String
+  message      String
+  traceId      String?
+  projectId    String?
+  taskId       String?
+  metadataJson String    @default("{}")
+  createdAt    DateTime  @default(now())
+
+  project      Project?  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  task         AsyncTask? @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([level, createdAt])
+  @@index([projectId, createdAt])
+  @@index([taskId, createdAt])
+  @@index([traceId])
+}
+
+model MetricSample {
+  id        String   @id @default(cuid())
+  name      String
+  value     Float
+  unit      String?
+  tagsJson  String   @default("{}")
+  createdAt DateTime @default(now())
+
+  @@index([name, createdAt])
+}
+
+model TraceSpan {
+  id             String    @id @default(cuid())
+  traceId        String
+  spanId         String    @unique
+  parentSpanId   String?
+  name           String
+  status         String    @default("running")
+  startedAt      DateTime  @default(now())
+  endedAt        DateTime?
+  durationMs     Int?
+  projectId      String?
+  taskId         String?
+  attributesJson String    @default("{}")
+
+  task           AsyncTask? @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  @@index([traceId, startedAt])
+  @@index([projectId, startedAt])
+  @@index([taskId, startedAt])
+  @@index([status, startedAt])
+}
+
+model ModelInvocation {
+  id               String    @id @default(cuid())
+  provider         String
+  model            String
+  promptTokens     Int?
+  completionTokens Int?
+  totalTokens      Int?
+  estimatedCostUsd Float?
+  latencyMs        Int
+  status           String
+  projectId        String?
+  traceId          String?
+  error            String?
+  createdAt        DateTime  @default(now())
+
+  project          Project?  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([provider, model, createdAt])
+  @@index([projectId, createdAt])
+  @@index([traceId])
+  @@index([status, createdAt])
+}
+
+model StoredArtifact {
+  id                  String             @id @default(cuid())
+  projectId           String
+  generatedArtifactId String?
+  artifactType        String
+  filename            String
+  mimeType            String
+  storageKind         String
+  storageKey          String
+  sizeBytes           Int
+  checksumSha256      String
+  textPreview         String?
+  version             Int                @default(1)
+  createdAt           DateTime           @default(now())
+
+  project             Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  generatedArtifact   GeneratedArtifact? @relation(fields: [generatedArtifactId], references: [id], onDelete: SetNull)
+
+  @@index([projectId, artifactType, createdAt])
+  @@index([generatedArtifactId])
+  @@unique([projectId, storageKey])
+}
+
+model MonitorJob {
+  id              String          @id @default(cuid())
+  projectId       String
+  hermesCronJobId String?
+  schedule        String
+  status          String          @default("active")
+  lastRunAt       DateTime?
+  nextRunAt       DateTime?
+  createdAt       DateTime        @default(now())
+
+  project         Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  reports         MonitorReport[]
+
+  @@index([projectId])
+}
+
+model MonitorReport {
+  id                        String     @id @default(cuid())
+  projectId                 String
+  jobId                     String
+  differentiationDriftScore Int
+  summary                   String
+  alertsJson                String
+  recommendedActionsJson    String
+  createdAt                 DateTime   @default(now())
+
+  project                   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  job                       MonitorJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, jobId])
+}

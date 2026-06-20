@@ -1,0 +1,303 @@
+import Link from "next/link";
+import { notFound } from "next/navigation";
+import { ArrowLeft, Boxes, CheckCircle2, ClipboardList, Code2, FileText, FlaskConical, Layers3, ScrollText, Sparkles } from "lucide-react";
+import { CodexPackActions } from "@/components/codex-pack-actions";
+import { HermesControlPanel } from "@/components/hermes-control-panel";
+import { ResearchRunStatus } from "@/components/research-run-status";
+import { ProjectPlanningSaveForm } from "@/components/save-report-forms";
+import { Badge, Card, Progress, buttonStyles, fieldStyles } from "@/components/ui";
+import { WorkflowActionButton } from "@/components/workflow-action-button";
+import { evaluateCurrentProject, exportCodexPack, savePrd, saveReportAssistantWithStatus, selectTechStack } from "@/app/actions";
+import { prisma } from "@/lib/db/prisma";
+import { evaluateProjectFlow, getLatestCodexPackArtifacts, getLatestPrd, getLatestResearch, isReportAssistantReady, parseReportAssistantContext, parseTechStackRecommendations } from "@/lib/services/project-flow";
+import { recommendedSkillSources } from "@/lib/skills/recommended-skills";
+import { skillSafetyPolicy } from "@/lib/skills/skill-policy";
+
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
+const workflowSteps = [
+  { label: "项目规划", id: "planning", icon: ClipboardList },
+  { label: "Hermes 调研", id: "research", icon: FlaskConical },
+  { label: "竞品矩阵", id: "competitors", icon: Layers3 },
+  { label: "差异化", id: "differentiation", icon: Sparkles },
+  { label: "PRD", id: "prd", icon: FileText },
+  { label: "技术栈", id: "tech-stack", icon: Boxes },
+  { label: "PDRS", id: "pdrs", icon: CheckCircle2 },
+  { label: "Codex Pack", id: "codex-pack", icon: Code2 },
+  { label: "原型", id: "prototype", icon: Sparkles }
+];
+
+export default async function ProjectPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const project = await prisma.project.findUnique({
+    where: { id },
+    include: {
+      competitors: true,
+      researchRuns: { orderBy: { createdAt: "desc" } },
+      evaluations: { orderBy: { createdAt: "desc" } },
+      artifacts: { orderBy: { createdAt: "desc" } },
+      monitorJobs: { orderBy: { createdAt: "desc" } }
+    }
+  });
+  if (!project) notFound();
+
+  const research = getLatestResearch(project);
+  const latestRun = project.researchRuns[0];
+  const reportContext = parseReportAssistantContext(project);
+  const reportReady = isReportAssistantReady(reportContext);
+  const pmAdvice = artifact(project, "pm_planning_advice") || "暂无项目规划建议。";
+  const prd = getLatestPrd(project);
+  const { evaluation } = evaluateProjectFlow(project);
+  const latestEvaluation = project.evaluations[0];
+  const codexArtifacts = getLatestCodexPackArtifacts(project);
+  const techStacks = parseTechStackRecommendations(project);
+  const selectedStack = artifact(project, "selected_tech_stack");
+  const prototypePrompt = artifact(project, "prototype_design_prompt");
+  const saveReportAction = saveReportAssistantWithStatus.bind(null, project.id);
+  const savePrdAction = savePrd.bind(null, project.id);
+  const evaluateAction = evaluateCurrentProject.bind(null, project.id);
+  const exportAction = exportCodexPack.bind(null, project.id);
+  const selectStackAction = selectTechStack.bind(null, project.id);
+  const currentScore = latestEvaluation?.pdrs ?? evaluation.pdrs;
+
+  return (
+    <main className="min-h-screen">
+      <header className="border-b border-stone-200/80 bg-[#fffdf8]/80 backdrop-blur">
+        <div className="mx-auto grid max-w-7xl gap-5 px-6 py-6">
+          <Link href="/projects" className="inline-flex w-fit items-center gap-2 text-sm font-semibold text-stone-600 transition hover:text-teal-800">
+            <ArrowLeft className="h-4 w-4" />
+            返回项目管理
+          </Link>
+          <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_320px]">
+            <div>
+              <p className="text-xs font-bold uppercase text-teal-800">SpecFlow Project</p>
+              <h1 className="mt-2 text-4xl font-semibold tracking-tight text-stone-950">{project.name}</h1>
+              <p className="mt-3 max-w-4xl text-sm leading-6 text-stone-600">{project.idea}</p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <Metric label="PDRS" value={Math.round(currentScore)} />
+              <Metric label="竞品" value={project.competitors.length} />
+              <Metric label="调研次数" value={project.researchRuns.length} />
+              <Metric label="产物" value={project.artifacts.length} />
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <div className="mx-auto grid max-w-7xl gap-6 px-6 py-8 lg:grid-cols-[220px_minmax(0,1fr)]">
+        <aside className="lg:sticky lg:top-5 lg:h-fit">
+          <nav className="rounded-lg border border-stone-200 bg-white/85 p-3 shadow-[var(--shadow)] backdrop-blur">
+            <p className="px-2 pb-2 text-xs font-bold uppercase text-stone-500">快速跳转</p>
+            <div className="flex gap-2 overflow-x-auto lg:grid lg:overflow-visible">
+              {workflowSteps.map((step) => {
+                const Icon = step.icon;
+                return (
+                  <a
+                    key={step.id}
+                    href={`#${step.id}`}
+                    className="inline-flex h-10 shrink-0 items-center gap-2 rounded-md px-3 text-sm font-semibold text-stone-700 transition hover:bg-teal-50 hover:text-teal-900"
+                  >
+                    <Icon className="h-4 w-4" />
+                    {step.label}
+                  </a>
+                );
+              })}
+            </div>
+          </nav>
+        </aside>
+
+        <div className="grid min-w-0 gap-6">
+          <Card id="planning">
+            <SectionTitle title="项目规划建议" subtitle="确认问题、用户和 3-5 个核心功能后，才能进入 Hermes 调研。" />
+            <ProjectPlanningSaveForm
+              action={saveReportAction}
+              pmAdvice={pmAdvice}
+              problemAndUsers={reportContext.problemAndUsers}
+              coreFeatures={reportContext.coreFeatures}
+              statusBadge={<Badge tone={reportReady ? "green" : "yellow"}>{reportReady ? "可运行 Hermes 调研" : "缺少前置内容"}</Badge>}
+            />
+          </Card>
+
+          <Card id="research" className="p-0">
+            <div className="grid gap-6 p-5">
+              <SectionTitle title="Hermes 调研" subtitle="读取项目规划、问题与用户、核心功能，生成竞品矩阵和差异化判断。" />
+              <HermesControlPanel projectId={project.id} recommended={recommendedSkillSources} policies={skillSafetyPolicy} />
+              <div className="grid gap-3 border-t border-stone-200 pt-5">
+                <div>
+                  <p className="text-sm font-semibold text-stone-950">调研执行</p>
+                  <p className="mt-1 text-xs leading-5 text-stone-500">先确认 Hermes 快速配置，再启动当前项目的真实调研任务。下方进度直接读取该项目实际调用记录。</p>
+                </div>
+              <WorkflowActionButton
+                label="运行 Hermes 调研"
+                endpoint={`/api/projects/${project.id}/research`}
+                pollEndpoint={`/api/projects/${project.id}/research`}
+                stages={["创建调研任务", "调用 Hermes", "解析竞品矩阵", "写入差异化判断"]}
+                background
+                disabled={!reportReady}
+                disabledReason="请先保存确认问题与用户，以及 3-5 个核心功能。"
+                className={buttonStyles.primary}
+              />
+              <Link href={`/projects/${project.id}/research-log`} className={buttonStyles.secondary}>
+                <ScrollText className="h-4 w-4" />
+                调研日志
+              </Link>
+              <ResearchRunStatus
+                endpoint={`/api/projects/${project.id}/research`}
+                initialStatus={latestRun ? {
+                  id: latestRun.id,
+                  hermesRunId: latestRun.hermesRunId,
+                  mode: latestRun.mode,
+                  status: latestRun.status as "queued" | "running" | "completed" | "failed" | "completed_without_output" | "completed_with_fallback",
+                  hasParsedOutput: Boolean(latestRun.parsedOutputJson),
+                  createdAt: latestRun.createdAt.toISOString(),
+                  completedAt: latestRun.completedAt?.toISOString() ?? null,
+                  events: []
+                } : { status: "not_started", events: [] }}
+              />
+              </div>
+            </div>
+          </Card>
+
+          <Card id="competitors">
+            <SectionTitle title="竞品矩阵" subtitle="Hermes 调研完成后，从结构化输出中提取。" />
+            <div className="mt-4 overflow-hidden rounded-lg border border-stone-200">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-stone-100 text-xs uppercase text-stone-500">
+                  <tr><th className="p-3">名称</th><th className="p-3">类型</th><th className="p-3">威胁</th><th className="p-3">复用策略</th></tr>
+                </thead>
+                <tbody className="divide-y divide-stone-200 bg-white/70">
+                  {project.competitors.map((item) => (
+                    <tr key={item.id}>
+                      <td className="p-3 font-semibold text-stone-950"><a href={item.url} className="text-teal-800 hover:text-teal-950">{item.name}</a><p className="mt-1 text-xs font-normal text-stone-500">{item.description}</p></td>
+                      <td className="p-3 text-stone-600">{item.type}</td>
+                      <td className="p-3 text-stone-600">{item.threatLevel}</td>
+                      <td className="p-3 text-stone-600">{item.reuseStrategy}</td>
+                    </tr>
+                  ))}
+                  {project.competitors.length === 0 && <tr><td colSpan={4} className="p-4 text-sm text-stone-500">尚未运行 Hermes 调研。</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+
+          <Card id="differentiation">
+            <SectionTitle title="差异化判断" subtitle="展示差异化分数、同质化风险和 MVP 修改建议。" />
+            {research ? (
+              <div className="mt-4 grid gap-4 lg:grid-cols-3">
+                <Score label="差异化分数" value={research.differentiation.differentiation_score} />
+                <Score label="同质化风险" value={research.differentiation.redundancy_risk} />
+                <div className="rounded-lg border border-stone-200 bg-white/70 p-4 lg:col-span-3">
+                  <p className="text-sm font-bold text-stone-950">MVP 修改建议</p>
+                  <p className="mt-2 text-sm leading-6 text-stone-600">{research.differentiation.mvp_reframe}</p>
+                </div>
+              </div>
+            ) : <p className="mt-4 text-sm text-stone-500">请先运行 Hermes 调研。</p>}
+          </Card>
+
+          <Card id="prd">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <SectionTitle title="PRD" subtitle="调研后生成，也可以手动编辑保存。" />
+              <WorkflowActionButton label="生成 PRD" endpoint={`/api/projects/${project.id}/generate-prd`} stages={["读取调研结果", "吸收差异化输入", "生成 PRD", "写入 artifact"]} className={buttonStyles.primary} />
+            </div>
+            <form action={savePrdAction} className="mt-4 grid gap-3">
+              <textarea name="content" rows={18} defaultValue={prd || "请先生成 PRD。"} className={`${fieldStyles} p-3 font-mono text-xs leading-6`} />
+              <button className={buttonStyles.secondary}>保存 PRD</button>
+            </form>
+          </Card>
+
+          <Card id="tech-stack">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <SectionTitle title="技术栈建议" subtitle="在 PRD 生成后使用，用于后续 Codex Pack。" />
+              <WorkflowActionButton label="生成技术栈建议" endpoint={`/api/projects/${project.id}/tech-stack`} stages={["读取 PRD", "分析约束", "生成方案", "写入 artifact"]} disabled={!prd} disabledReason="请先生成 PRD。" className={buttonStyles.primary} />
+            </div>
+            <form action={selectStackAction} className="mt-4 grid gap-3 lg:grid-cols-3">
+              {techStacks.map((stack) => (
+                <label key={stack.id} className="grid gap-3 rounded-lg border border-stone-200 bg-white/70 p-4">
+                  <input type="radio" name="stackId" value={stack.id} defaultChecked={selectedStack.includes(stack.id) || Boolean(project.preferredTechStack?.startsWith(stack.name))} />
+                  <p className="font-bold text-stone-950">{stack.name}</p>
+                  <p className="text-sm leading-6 text-stone-600">{stack.reason}</p>
+                  <p className="text-xs leading-5 text-stone-600">{stack.components.join("、")}</p>
+                  <Badge tone={stack.recommendation === "high" ? "green" : stack.recommendation === "medium" ? "yellow" : "slate"}>{stack.recommendation}</Badge>
+                </label>
+              ))}
+              {techStacks.length === 0 && <p className="rounded-lg bg-stone-100 p-4 text-sm text-stone-500 lg:col-span-3">PRD 生成后可生成技术栈建议。</p>}
+              {techStacks.length > 0 && <button className={`${buttonStyles.primary} lg:col-span-3`}>保存选择</button>}
+            </form>
+            {project.preferredTechStack && <p className="mt-3 text-sm text-stone-600">当前选择：{project.preferredTechStack}</p>}
+          </Card>
+
+          <Card id="pdrs">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <SectionTitle title="PDRS" subtitle="综合 PRD、差异化判断、竞品矩阵和 Hermes 调研结果生成产品决策评分。" />
+              <form action={evaluateAction}><button className={buttonStyles.primary}>运行评估</button></form>
+            </div>
+            <div className="mt-4 grid gap-4 lg:grid-cols-2">
+              <Score label="当前估算" value={evaluation.pdrs} />
+              <Score label="最近保存分数" value={latestEvaluation?.pdrs ?? evaluation.pdrs} />
+              <div className="lg:col-span-2"><Progress value={currentScore} /></div>
+            </div>
+          </Card>
+
+          <Card id="codex-pack">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <SectionTitle title="Codex Pack" subtitle="使用已选技术栈生成实现任务、提示词和验收标准。" />
+              <form action={exportAction}><button className={buttonStyles.primary}>导出 Codex Pack</button></form>
+            </div>
+            <div className="mt-4 grid gap-3">
+              {codexArtifacts.length > 0 ? (
+                <>
+                  <CodexPackActions files={codexArtifacts.map((item) => ({ filename: item.artifactType, content: item.content }))} locale="zh" />
+                  {codexArtifacts.map((item) => (
+                    <details key={item.id} className="rounded-lg border border-stone-200 bg-white/80 p-3">
+                      <summary className="cursor-pointer font-semibold text-stone-900">{item.artifactType}</summary>
+                      <pre className="mt-3 max-h-96 overflow-auto whitespace-pre-wrap rounded-md bg-stone-100 p-3 text-xs leading-6 text-stone-700">{item.content}</pre>
+                    </details>
+                  ))}
+                </>
+              ) : <p className="rounded-lg bg-stone-100 p-4 text-sm text-stone-500">尚未导出 Codex Pack。</p>}
+            </div>
+          </Card>
+
+          <Card id="prototype">
+            <SectionTitle title="原型设计" subtitle="基于 PRD、Hermes 调研和差异化建议生成原型设计 prompt。" />
+            <WorkflowActionButton label="生成原型设计 prompt" endpoint={`/api/projects/${project.id}/prototype-prompt`} stages={["读取 PRD", "汇总 Hermes 调研", "吸收差异化建议", "写入 prompt artifact"]} disabled={!prd} disabledReason="请先生成或保存 PRD。" className={`${buttonStyles.primary} mt-4`} />
+            {prototypePrompt ? <pre className="mt-4 max-h-96 overflow-auto whitespace-pre-wrap rounded-lg border border-stone-200 bg-stone-100 p-4 text-xs leading-6 text-stone-700">{prototypePrompt}</pre> : <p className="mt-4 rounded-lg bg-stone-100 p-4 text-sm text-stone-500">尚未生成原型设计 prompt。</p>}
+          </Card>
+        </div>
+      </div>
+    </main>
+  );
+}
+
+function SectionTitle({ title, subtitle }: { title: string; subtitle: string }) {
+  return (
+    <div>
+      <h2 className="text-lg font-bold text-stone-950">{title}</h2>
+      <p className="mt-1 text-sm leading-6 text-stone-500">{subtitle}</p>
+    </div>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="rounded-lg border border-stone-200 bg-white/70 p-4">
+      <p className="text-xs text-stone-500">{label}</p>
+      <p className="mt-1 text-2xl font-semibold text-stone-950">{value}</p>
+    </div>
+  );
+}
+
+function Score({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="rounded-lg border border-stone-200 bg-white/70 p-4">
+      <p className="text-xs font-bold uppercase text-stone-500">{label}</p>
+      <p className="mt-2 text-3xl font-semibold text-stone-950">{Math.round(value)}</p>
+      <div className="mt-3"><Progress value={value} /></div>
+    </div>
+  );
+}
+
+function artifact(project: { artifacts: Array<{ artifactType: string; content: string }> }, type: string) {
+  return project.artifacts.find((item) => item.artifactType === type)?.content || "";
+}

@@ -1,0 +1,2 @@
+-- No-op for PostgreSQL migration history.
+-- The intake columns are added by 20260601090000_project_intake_options.

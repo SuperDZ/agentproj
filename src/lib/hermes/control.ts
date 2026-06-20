@@ -1,0 +1,948 @@
+import { execFile, spawn } from "node:child_process";
+import { accessSync, constants } from "node:fs";
+import fs from "node:fs/promises";
+import path from "node:path";
+import type {
+  RecommendedSkillSource,
+  SkillInventoryItem,
+  SkillInventoryResponse,
+  SkillKind,
+  SkillSearchResult,
+  SkillSearchSafety,
+  SkillWhitelistEntry
+} from "@/lib/skills/skill-types";
+
+const stateDir = path.join(process.cwd(), ".next", "hermes");
+const pidFile = path.join(stateDir, "dashboard.pid");
+const modelConfigFile = path.join(stateDir, "model-config.json");
+const inventoryCacheDir = path.join(process.cwd(), ".cache", "hermes", "skills-inventory-cache");
+
+export type HermesModelConfig = {
+  provider: string;
+  model: string;
+  usageMode: "api" | "codex-cli";
+  codexCliCommand: string;
+};
+
+const officialReviewedSkillRepos = new Set(["NousResearch/hermes-agent", "Hermes bundled skills"]);
+const recommendedToolNames = new Set(["excalidraw/excalidraw", "tldraw/tldraw", "gitbrent/PptxGenJS", "recharts/recharts"]);
+
+export function hermesRoot() {
+  return process.env.HERMES_LOCAL_ROOT || "hermes-agent";
+}
+
+export function hermesPython() {
+  const configuredPython = process.env.HERMES_LOCAL_PYTHON?.trim();
+  if (configuredPython) return configuredPython;
+
+  if (process.platform === "win32") {
+    return path.join(hermesRoot(), ".venv", "Scripts", "python.exe");
+  }
+
+  const virtualEnvPython = path.join(hermesRoot(), ".venv", "bin", "python");
+  if (executableExistsSync(virtualEnvPython)) return virtualEnvPython;
+  if (executableExistsSync("python3")) return "python3";
+  return "python";
+}
+
+function executablePathExists(file: string) {
+  try {
+    accessSync(file, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function windowsCommandCandidates(command: string) {
+  const extensions = (process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM")
+    .split(";")
+    .map((extension) => extension.trim())
+    .filter(Boolean);
+  return [command, ...extensions.map((extension) => `${command}${extension}`)];
+}
+
+function executableExistsSync(command: string) {
+  if (command.includes("/") || command.includes("\\") || path.isAbsolute(command)) {
+    return executablePathExists(command);
+  }
+
+  const pathEntries = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  const commandCandidates = process.platform === "win32" ? windowsCommandCandidates(command) : [command];
+  for (const entry of pathEntries) {
+    for (const candidate of commandCandidates) {
+      if (executablePathExists(path.join(entry, candidate))) return true;
+    }
+  }
+  return false;
+}
+
+export function hermesPythonDiagnostics() {
+  const localPython = hermesPython();
+  const pythonExists = executableExistsSync(localPython);
+  const configuredPython = process.env.HERMES_LOCAL_PYTHON?.trim();
+  const virtualEnvPython = process.platform === "win32"
+    ? path.join(hermesRoot(), ".venv", "Scripts", "python.exe")
+    : path.join(hermesRoot(), ".venv", "bin", "python");
+  const virtualEnvPythonExists = executableExistsSync(virtualEnvPython);
+  const fallbackCandidates = process.platform === "win32" ? [] : ["python3", "python"];
+
+  return {
+    localPython,
+    pythonExists,
+    pythonDiagnostics: pythonExists
+      ? "Python executable resolved successfully."
+      : `Python executable not found: ${localPython}. Set HERMES_LOCAL_PYTHON or create the Hermes virtual environment at ${virtualEnvPython}.`,
+    pythonSource: configuredPython ? "HERMES_LOCAL_PYTHON" : virtualEnvPythonExists ? "venv" : "fallback",
+    virtualEnvPython,
+    virtualEnvPythonExists,
+    fallbackCandidates
+  };
+}
+
+function whitelistFile() {
+  return path.join(hermesRoot(), "skills", "safety-whitelist.json");
+}
+
+function descriptionCacheFile() {
+  return path.join(hermesRoot(), "skills", "zh-descriptions.json");
+}
+
+function emptySkillsInventory(): SkillInventoryResponse {
+  return {
+    recommendedSkills: [],
+    recommendedTools: [],
+    installedSkills: [],
+    installedTools: []
+  };
+}
+
+function inventoryCacheFile(cacheKey = "global") {
+  const safeKey = cacheKey.replace(/[^a-z0-9_-]+/gi, "-").replace(/^-+|-+$/g, "") || "global";
+  return path.join(inventoryCacheDir, `${safeKey}.json`);
+}
+
+function exec(command: string, args: string[], cwd = process.cwd(), timeout = 120_000) {
+  return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    execFile(command, args, { cwd, timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(String(stderr || stdout || error.message)));
+        return;
+      }
+      resolve({ stdout: String(stdout), stderr: String(stderr) });
+    });
+  });
+}
+
+async function detectHermesDashboardProcesses() {
+  try {
+    const result = process.platform === "win32"
+      ? await exec("powershell.exe", [
+        "-NoProfile",
+        "-Command",
+        "$current=$PID; Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $current -and $_.CommandLine -match 'hermes_cli\\.main\\s+dashboard' } | Select-Object -ExpandProperty ProcessId"
+      ], process.cwd(), 10_000)
+      : await exec("ps", ["-eo", "pid=,args="], process.cwd(), 10_000);
+
+    const lines = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const pids = process.platform === "win32"
+      ? lines.map((line) => Number(line)).filter((pid) => Number.isInteger(pid) && pid > 0)
+      : lines
+        .filter((line) => /hermes_cli\.main\s+dashboard/.test(line))
+        .map((line) => Number(line.match(/^\d+/)?.[0]))
+        .filter((pid) => Number.isInteger(pid) && pid > 0);
+
+    return Array.from(new Set(pids));
+  } catch {
+    return [];
+  }
+}
+
+async function readJsonFile<T>(file: string, fallback: T): Promise<T> {
+  try {
+    return JSON.parse(await fs.readFile(file, "utf8")) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+async function writeJsonFile(file: string, value: unknown) {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, JSON.stringify(value, null, 2), "utf8");
+}
+
+function stringValue(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeUsageMode(value: unknown): HermesModelConfig["usageMode"] {
+  return value === "codex-cli" ? "codex-cli" : "api";
+}
+
+export async function readModelConfig(): Promise<HermesModelConfig> {
+  const savedModelConfig = await readJsonFile<Record<string, unknown>>(modelConfigFile, {});
+  return {
+    provider: stringValue(savedModelConfig.provider),
+    model: stringValue(savedModelConfig.model),
+    usageMode: normalizeUsageMode(savedModelConfig.usageMode),
+    codexCliCommand: stringValue(savedModelConfig.codexCliCommand) || "codex"
+  };
+}
+
+export async function getHermesStatus() {
+  const recordedDashboardPid = await readDashboardPid();
+  const detectedDashboardPids = await detectHermesDashboardProcesses();
+  const dashboardPids = Array.from(new Set([
+    ...(recordedDashboardPid ? [recordedDashboardPid] : []),
+    ...detectedDashboardPids
+  ]));
+  const dashboardPid = recordedDashboardPid || detectedDashboardPids[0];
+
+  const savedModelConfig = await readModelConfig();
+  const pythonDiagnostics = hermesPythonDiagnostics();
+  return {
+    mode: process.env.HERMES_MODE || "real",
+    localRoot: hermesRoot(),
+    ...pythonDiagnostics,
+    provider: savedModelConfig.provider || process.env.HERMES_LOCAL_PROVIDER || process.env.HERMES_INFERENCE_PROVIDER || "",
+    model: savedModelConfig.model || process.env.HERMES_LOCAL_MODEL || process.env.HERMES_INFERENCE_MODEL || "",
+    usageMode: savedModelConfig.usageMode,
+    codexCliCommand: savedModelConfig.codexCliCommand,
+    dashboardPid,
+    dashboardPids,
+    dashboardPidSource: recordedDashboardPid ? "pid-file" : dashboardPid ? "process-scan" : "none"
+  };
+}
+
+export async function saveModelConfig(config: { provider: string; model: string; usageMode: string; codexCliCommand?: string }) {
+  const normalized = {
+    provider: stringValue(config.provider),
+    model: stringValue(config.model),
+    usageMode: normalizeUsageMode(config.usageMode),
+    codexCliCommand: stringValue(config.codexCliCommand) || "codex"
+  };
+  await writeJsonFile(modelConfigFile, normalized);
+  return normalized;
+}
+
+function formatHermesStartupError(message: string, details: { stderr?: string; code?: number | null; signal?: NodeJS.Signals | null }) {
+  const stderr = details.stderr?.trim();
+  const exitDetail = details.code !== undefined || details.signal
+    ? ` Exit code: ${details.code ?? "none"}${details.signal ? `, signal: ${details.signal}` : ""}.`
+    : "";
+  const stderrDetail = stderr ? ` Stderr: ${stderr}` : "";
+  return new Error(`${message}${exitDetail}${stderrDetail}`);
+}
+
+function processExists(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error instanceof Error && "code" in error && error.code === "EPERM";
+  }
+}
+
+async function readDashboardPid() {
+  try {
+    const parsed = Number(await fs.readFile(pidFile, "utf8"));
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      await fs.rm(pidFile, { force: true });
+      return undefined;
+    }
+    if (!processExists(parsed)) {
+      await fs.rm(pidFile, { force: true });
+      return undefined;
+    }
+    return parsed;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function startHermesDashboard() {
+  const currentStatus = await getHermesStatus();
+  if (currentStatus.dashboardPid) return currentStatus;
+
+  const root = hermesRoot();
+  const python = hermesPython();
+
+  try {
+    const rootStat = await fs.stat(root);
+    if (!rootStat.isDirectory()) {
+      throw new Error(`Hermes root is not a directory: ${root}`);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Hermes root is not a directory")) throw error;
+    throw new Error(`Hermes root does not exist or is not accessible: ${root}`);
+  }
+
+  if (!executableExistsSync(python)) {
+    throw new Error(`Hermes Python executable is not executable or cannot be resolved: ${python}`);
+  }
+
+  await fs.mkdir(stateDir, { recursive: true });
+
+  const child = spawn(python, ["-m", "hermes_cli.main", "dashboard"], {
+    cwd: root,
+    detached: true,
+    stdio: ["ignore", "ignore", "pipe"],
+    windowsHide: true
+  });
+
+  let stderr = "";
+  const maxStartupStderrLength = 16 * 1024;
+  const appendStderr = (chunk: Buffer | string) => {
+    stderr = `${stderr}${chunk.toString()}`.slice(-maxStartupStderrLength);
+  };
+  child.stderr?.on("data", appendStderr);
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const startupWindowMs = 750;
+
+    const settle = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off("error", onError);
+      child.off("close", onClose);
+      callback();
+    };
+
+    const onError = (error: Error) => {
+      child.stderr?.off("data", appendStderr);
+      settle(() => reject(formatHermesStartupError(`Failed to start Hermes dashboard: ${error.message}`, { stderr })));
+    };
+
+    const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
+      child.stderr?.off("data", appendStderr);
+      settle(() => reject(formatHermesStartupError("Hermes dashboard exited during startup.", { stderr, code, signal })));
+    };
+
+    const timer = setTimeout(() => {
+      settle(() => resolve());
+    }, startupWindowMs);
+    child.once("error", onError);
+    child.once("close", onClose);
+  });
+
+  const stderrPipe = child.stderr as (NodeJS.ReadableStream & { unref?: () => void }) | null;
+  stderrPipe?.unref?.();
+
+  if (!child.pid) {
+    throw new Error("Hermes dashboard started without a process id; pid file was not written.");
+  }
+
+  child.unref();
+  await fs.writeFile(pidFile, String(child.pid), "utf8");
+  return getHermesStatus();
+}
+
+export async function stopHermesDashboard() {
+  const status = await getHermesStatus();
+  for (const pid of status.dashboardPids) {
+    if (!processExists(pid)) continue;
+    try {
+      process.kill(pid);
+    } catch {
+      // 进程可能已经退出。
+    }
+  }
+  await fs.rm(pidFile, { force: true });
+  return getHermesStatus();
+}
+
+export async function restartHermesDashboard() {
+  await stopHermesDashboard();
+  return startHermesDashboard();
+}
+
+export async function readSkillWhitelist(): Promise<SkillWhitelistEntry[]> {
+  const entries = await readJsonFile<SkillWhitelistEntry[]>(whitelistFile(), []);
+  return entries.filter((entry) => entry?.name).map((entry) => ({ ...entry, kind: entry.kind || "skill" }));
+}
+
+export async function addSkillWhitelist(entry: Omit<SkillWhitelistEntry, "addedAt"> & { addedAt?: string }) {
+  const entries = await readSkillWhitelist();
+  const normalized: SkillWhitelistEntry = {
+    name: entry.name,
+    url: entry.url || undefined,
+    cloneUrl: entry.cloneUrl || undefined,
+    kind: entry.kind || "skill",
+    addedAt: entry.addedAt || new Date().toISOString()
+  };
+  const next = entries.filter((item) => !sameWhitelistEntry(item, normalized));
+  next.unshift(normalized);
+  await writeJsonFile(whitelistFile(), next);
+  return normalized;
+}
+
+export async function removeSkillWhitelist(name: string) {
+  const entries = await readSkillWhitelist();
+  const next = entries.filter((entry) => entry.name !== name);
+  await writeJsonFile(whitelistFile(), next);
+  return { removed: entries.length - next.length };
+}
+
+export function sameWhitelistEntry(left: SkillWhitelistEntry, right: Pick<SkillWhitelistEntry, "name" | "url" | "cloneUrl">) {
+  return left.name === right.name || (!!left.url && left.url === right.url) || (!!left.cloneUrl && left.cloneUrl === right.cloneUrl);
+}
+
+function isWhitelisted(item: Pick<SkillWhitelistEntry, "name" | "url" | "cloneUrl">, whitelist: SkillWhitelistEntry[]) {
+  return whitelist.some((entry) => sameWhitelistEntry(entry, item));
+}
+
+function safety(status: SkillSearchSafety["status"], label: string, reasons: string[]): SkillSearchSafety {
+  return { status, label, reasons };
+}
+
+function evaluateSkillSafety(item: {
+  name: string;
+  url?: string;
+  cloneUrl?: string;
+  archived?: boolean;
+  disabled?: boolean;
+  kind?: SkillKind;
+  whitelisted?: boolean;
+}): SkillSearchSafety {
+  if (item.whitelisted || officialReviewedSkillRepos.has(item.name)) {
+    return safety("passed", "已通过本地或官方安全检查", ["该来源在本地白名单或官方内置白名单中。"]);
+  }
+
+  if (item.archived || item.disabled || !item.url || (!item.cloneUrl && item.kind !== "tool")) {
+    return safety("failed", "未通过安全检查", [
+      item.archived ? "仓库已归档。" : "",
+      item.disabled ? "仓库已禁用。" : "",
+      !item.url ? "缺少可验证来源链接。" : "",
+      !item.cloneUrl && item.kind !== "tool" ? "缺少 clone 地址。" : ""
+    ].filter(Boolean));
+  }
+
+  return safety("unreviewed", "未经过本地白名单审查", ["来源可验证，但尚未加入本地白名单。导入前需要人工检查许可证、脚本和 Prompt Injection（提示注入）风险。"]);
+}
+
+type GithubRepo = {
+  full_name?: string;
+  description?: string | null;
+  stargazers_count?: number;
+  html_url?: string;
+  clone_url?: string;
+  updated_at?: string;
+  pushed_at?: string;
+  archived?: boolean;
+  disabled?: boolean;
+};
+
+export async function searchGithubSkills(query: string): Promise<SkillSearchResult[]> {
+  const search = encodeURIComponent(`${query || "agent skills"} skill OR skills`);
+  const response = await fetch(`https://api.github.com/search/repositories?q=${search}&sort=stars&order=desc&per_page=10`, {
+    headers: { accept: "application/vnd.github+json" }
+  });
+  if (!response.ok) throw new Error(`GitHub search failed: ${response.status}`);
+
+  const whitelist = await readSkillWhitelist();
+  const data = (await response.json()) as { items?: GithubRepo[] };
+  return (data.items ?? []).map((item) => {
+    const name = item.full_name || "unknown/repository";
+    const whitelisted = isWhitelisted({ name, url: item.html_url, cloneUrl: item.clone_url }, whitelist);
+    return {
+      kind: "skill",
+      name,
+      description: item.description || undefined,
+      stars: item.stargazers_count ?? 0,
+      url: item.html_url,
+      cloneUrl: item.clone_url,
+      updatedAt: item.updated_at || item.pushed_at,
+      whitelisted,
+      safety: evaluateSkillSafety({
+        name,
+        url: item.html_url,
+        cloneUrl: item.clone_url,
+        archived: item.archived,
+        disabled: item.disabled,
+        kind: "skill",
+        whitelisted
+      })
+    };
+  });
+}
+
+function slug(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "imported-skill";
+}
+
+type ImportGithubSkillInput = {
+  cloneUrl?: string;
+  identifier?: string;
+  name: string;
+  safetyStatus?: SkillSearchSafety["status"];
+  url?: string;
+};
+
+export class SkillImportForbiddenError extends Error {
+  status = 403;
+
+  constructor(message = "该来源尚未通过白名单校验，请先人工复核并加入白名单。") {
+    super(message);
+    this.name = "SkillImportForbiddenError";
+  }
+}
+
+export type SkillImportSource = Pick<SkillWhitelistEntry, "name" | "url" | "cloneUrl">;
+
+function githubRepoFromUrl(value?: string) {
+  if (!value) return undefined;
+  const normalized = value.replace(/\.git$/i, "");
+  const match = normalized.match(/github\.com[:/]+([^/\s]+)\/([^/\s#?]+)/i);
+  if (!match) return undefined;
+  return `${match[1]}/${match[2]}`;
+}
+
+function githubRepoFromIdentifier(value?: string) {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const repoFromUrl = githubRepoFromUrl(trimmed);
+  if (repoFromUrl) return repoFromUrl;
+  const match = trimmed.match(/^([^/\s]+)\/([^/\s]+)(?:\/[^\s]+)?$/);
+  return match ? `${match[1]}/${match[2]}` : undefined;
+}
+
+export function resolveSkillImportSource(input: ImportGithubSkillInput): SkillImportSource {
+  const name = input.name?.trim();
+  const url = input.url?.trim();
+  const cloneUrl = input.cloneUrl?.trim();
+  const identifier = input.identifier?.trim();
+
+  const repoFromIdentifier = githubRepoFromIdentifier(identifier);
+  const repoFromUrl = githubRepoFromUrl(url);
+  const repoFromClone = githubRepoFromUrl(cloneUrl);
+  const repo = repoFromUrl || repoFromClone || repoFromIdentifier;
+
+  return {
+    name: repo || name,
+    url: url || (repo ? `https://github.com/${repo}` : identifier?.startsWith("http") ? identifier : undefined),
+    cloneUrl: cloneUrl || (repo ? `https://github.com/${repo}.git` : undefined)
+  };
+}
+
+export async function assertSkillImportWhitelisted(input: ImportGithubSkillInput) {
+  if (input.safetyStatus === "failed") {
+    throw new SkillImportForbiddenError("该来源未通过安全检查，请先人工复核并加入白名单。");
+  }
+
+  const source = resolveSkillImportSource(input);
+  if (!source.name) throw new Error("name is required.");
+  const whitelist = await readSkillWhitelist();
+  if (!isWhitelisted(source, whitelist)) {
+    throw new SkillImportForbiddenError();
+  }
+  return source;
+}
+
+function trustedInstallInput(input: ImportGithubSkillInput, source: SkillImportSource): ImportGithubSkillInput {
+  const url = source.url;
+  const repo = githubRepoFromUrl(url) || githubRepoFromUrl(source.cloneUrl) || githubRepoFromIdentifier(source.name);
+  const identifier = url?.match(/^https?:\/\/.+\.md(?:[?#].*)?$/i)
+    ? url
+    : repo || source.name;
+
+  return {
+    name: source.name || input.name,
+    url: source.url,
+    cloneUrl: source.cloneUrl,
+    identifier
+  };
+}
+
+function githubApiHeaders() {
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+  return {
+    accept: "application/vnd.github+json",
+    ...(token ? { authorization: `Bearer ${token}` } : {})
+  };
+}
+
+async function resolveGithubSkillIdentifier(input: ImportGithubSkillInput) {
+  if (input.identifier?.trim()) return input.identifier.trim();
+  if (input.url?.match(/^https?:\/\/.+\.md(?:[?#].*)?$/i)) return input.url.trim();
+
+  const repo = githubRepoFromUrl(input.url) || githubRepoFromUrl(input.cloneUrl);
+  if (!repo) throw new Error("无法解析 GitHub 仓库地址。");
+
+  const repoResponse = await fetch(`https://api.github.com/repos/${repo}`, { headers: githubApiHeaders() });
+  if (!repoResponse.ok) throw new Error(`无法读取 GitHub 仓库信息：${repoResponse.status}`);
+  const repoInfo = (await repoResponse.json()) as { default_branch?: string };
+  const branch = repoInfo.default_branch || "main";
+
+  const treeResponse = await fetch(`https://api.github.com/repos/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`, { headers: githubApiHeaders() });
+  if (!treeResponse.ok) throw new Error(`无法读取 GitHub 仓库文件树：${treeResponse.status}`);
+  const treeInfo = (await treeResponse.json()) as { tree?: Array<{ path?: string; type?: string }> };
+  const skillFiles = (treeInfo.tree ?? [])
+    .filter((item) => item.type === "blob" && item.path?.split("/").pop() === "SKILL.md")
+    .map((item) => item.path as string)
+    .sort((left, right) => left.split("/").length - right.split("/").length || left.localeCompare(right));
+
+  if (!skillFiles.length) throw new Error("该 GitHub 仓库中没有找到 SKILL.md，Hermes 无法按 Skill 安装。");
+  const skillDir = skillFiles[0].replace(/\/?SKILL\.md$/i, "");
+  return skillDir ? `${repo}/${skillDir}` : `https://raw.githubusercontent.com/${repo}/${branch}/SKILL.md`;
+}
+
+async function installSkillWithHermes(input: ImportGithubSkillInput) {
+  const identifier = await resolveGithubSkillIdentifier(input);
+  const args = ["-m", "hermes_cli.main", "skills", "install", identifier, "--category", "imported", "--yes"];
+  if (identifier.startsWith("http")) args.push("--name", slug(input.name));
+  const result = await exec(hermesPython(), args, hermesRoot(), 300_000);
+  return { identifier, mode: "hermes-cli", stdout: result.stdout, stderr: result.stderr };
+}
+
+export async function importGithubSkill(input: ImportGithubSkillInput) {
+  const source = await assertSkillImportWhitelisted(input);
+  return installSkillWithHermes(trustedInstallInput(input, source));
+}
+
+async function importGithubSkillLegacyClone(cloneUrl: string, name: string) {
+  if (!cloneUrl) throw new Error("缺少 clone 地址，无法导入。");
+  const target = path.join(hermesRoot(), "skills", "imported", slug(name));
+  await fs.mkdir(path.dirname(target), { recursive: true });
+
+  let exists = false;
+  try {
+    await fs.access(target);
+    exists = true;
+  } catch {
+    exists = false;
+  }
+
+  if (exists) {
+    await exec("git", ["-C", target, "pull", "--ff-only"], hermesRoot(), 300_000);
+  } else {
+    await exec("git", ["clone", "--depth", "1", cloneUrl, target], hermesRoot(), 300_000);
+  }
+  return { path: target };
+}
+
+void importGithubSkillLegacyClone;
+
+export async function createCustomSkill(name: string, body: string) {
+  const target = path.join(hermesRoot(), "skills", "custom", slug(name));
+  await fs.mkdir(target, { recursive: true });
+  await fs.writeFile(path.join(target, "SKILL.md"), body || `# ${name}\n\n## Purpose\n该 Skill（技能）用于补充本地 Hermes 工作流，启用前需要人工复核。\n`, "utf8");
+  return { path: target };
+}
+
+async function findSkillFiles(root: string, depth = 0): Promise<string[]> {
+  if (depth > 6) return [];
+  let entries: Array<{ name: string; isFile: () => boolean; isDirectory: () => boolean }>;
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const found: string[] = [];
+  for (const entry of entries) {
+    if (entry.name === ".git" || entry.name === "__pycache__" || entry.name === "node_modules") continue;
+    const fullPath = path.join(root, entry.name);
+    if (entry.isFile() && entry.name === "SKILL.md") {
+      found.push(fullPath);
+    } else if (entry.isDirectory()) {
+      found.push(...(await findSkillFiles(fullPath, depth + 1)));
+    }
+  }
+  return found;
+}
+
+function titleFromSkill(content: string, fallback: string) {
+  const title = content.match(/^#\s+(.+)$/m)?.[1]?.trim();
+  return title || fallback;
+}
+
+function frontmatterDescription(content: string) {
+  const frontmatter = content.match(/^---\s*\n([\s\S]*?)\n---/);
+  const description = frontmatter?.[1].match(/^description:\s*(?:"([^"]+)"|'([^']+)'|(.+))\s*$/m);
+  return description ? (description[1] || description[2] || description[3] || "").trim() : "";
+}
+
+function descriptionFromSkill(content: string) {
+  const predefined = frontmatterDescription(content);
+  if (predefined) return predefined;
+  const purpose = content.match(/##\s+Purpose\s*\n([\s\S]*?)(?:\n##\s+|$)/i)?.[1];
+  const source = purpose || content.replace(/^#.*$/m, "");
+  const line = source
+    .split(/\r?\n/)
+    .map((item) => item.replace(/^[-*]\s+/, "").trim())
+    .find((item) => item && !item.startsWith("#"));
+  return line || "";
+}
+
+function containsChinese(value: string) {
+  return /[\u4e00-\u9fff]/.test(value);
+}
+
+async function descriptionZh(key: string, name: string, sourceText?: string) {
+  const cache = await readJsonFile<Record<string, string>>(descriptionCacheFile(), {});
+  if (cache[key]) return cache[key];
+
+  const text = sourceText?.trim();
+  const value = text && containsChinese(text)
+    ? text.slice(0, 180)
+    : `该 ${key.startsWith("tool:") ? "Tool（工具）" : "Skill（技能）"} 用于 ${name.replace(/[-_]/g, " ")} 相关工作流，导入或启用前需要人工复核来源、权限和执行风险。`;
+
+  cache[key] = value;
+  await writeJsonFile(descriptionCacheFile(), cache);
+  return value;
+}
+
+void descriptionZh;
+
+function sourceFromPath(filePath: string): SkillInventoryItem["source"] {
+  const normalized = filePath.toLowerCase();
+  if (normalized.includes(`${path.sep}optional-skills${path.sep}`)) return "optional";
+  if (normalized.includes(`${path.sep}imported${path.sep}`)) return "imported";
+  if (normalized.includes(`${path.sep}custom${path.sep}`)) return "custom";
+  return "installed";
+}
+
+async function findPythonToolFiles(root: string): Promise<string[]> {
+  let entries: Array<{ name: string; isFile: () => boolean; isDirectory: () => boolean }>;
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const found: string[] = [];
+  for (const entry of entries) {
+    if (entry.name === ".git" || entry.name === "__pycache__" || entry.name === "node_modules") continue;
+    const fullPath = path.join(root, entry.name);
+    if (entry.isFile() && entry.name.endsWith(".py")) {
+      found.push(fullPath);
+    } else if (entry.isDirectory()) {
+      found.push(...(await findPythonToolFiles(fullPath)));
+    }
+  }
+  return found;
+}
+
+function categoryFromSkillPath(file: string) {
+  const root = path.resolve(hermesRoot());
+  const relative = path.relative(root, file);
+  const parts = relative.split(path.sep);
+  if (parts[0] === "optional-skills") return `optional/${parts[1] || "uncategorized"}`;
+  if (parts[0] === "skills") return parts[1] || "uncategorized";
+  return path.basename(path.dirname(path.dirname(file)));
+}
+
+function nameFromToolPath(toolRoot: string, toolPath: string) {
+  const relative = path.relative(toolRoot, toolPath).replace(/\\/g, "/").replace(/\.py$/i, "");
+  return relative || path.basename(toolPath).replace(/\.py$/i, "");
+}
+
+function categoryFromToolPath(toolRoot: string, toolPath: string) {
+  const relativeDir = path.dirname(path.relative(toolRoot, toolPath));
+  return relativeDir === "." ? "python" : relativeDir.replace(/\\/g, "/");
+}
+
+function normalizeDescriptionText(value: string) {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function stripMarkdownForDescription(value: string) {
+  return value
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/^#+\s*/gm, "")
+    .replace(/^[-*]\s+/gm, "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1");
+}
+
+function firstDescriptionSentence(source: string) {
+  const lines = stripMarkdownForDescription(source)
+    .split(/\r?\n/)
+    .map((item) => normalizeDescriptionText(item))
+    .filter((item) => item && !item.startsWith("#") && !/^usage:?$/i.test(item) && !/^environment variables:?$/i.test(item));
+  const line = lines.find((item) => item.length >= 24) ?? lines[0];
+  if (!line) return "";
+  return (line.match(/^.{18,220}?[.!?。！？](?:\s|$)/)?.[0] ?? line).trim().slice(0, 220);
+}
+
+function humanReadableName(name: string) {
+  return name.replace(/[_-]+/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function isStaleDescription(value: string) {
+  return /导入|启用前|人工复核|执行风险|权限|鐢ㄤ簬|瀵煎叆|鍚敤|椋庨櫓|璇\?Tool|璇\?Skill/i.test(value);
+}
+
+function inventoryFallbackDescription(kind: SkillKind, name: string) {
+  return kind === "tool"
+    ? `${humanReadableName(name)} 是本地 Hermes 工具，当前未在源码头部或 README 中发现可提取的功能说明。`
+    : `${humanReadableName(name)} 是本地 Hermes Skill，当前未在 SKILL.md 中发现可提取的功能说明。`;
+}
+
+async function inventoryDescription(key: string, kind: SkillKind, name: string, sourceText?: string) {
+  const cache = await readJsonFile<Record<string, string>>(descriptionCacheFile(), {});
+  if (cache[key] && !isStaleDescription(cache[key])) return cache[key];
+
+  const value = firstDescriptionSentence(sourceText ?? "") || inventoryFallbackDescription(kind, name);
+  cache[key] = value;
+  await writeJsonFile(descriptionCacheFile(), cache);
+  return value;
+}
+
+async function recommendedInventoryItems(recommended: RecommendedSkillSource[] = []) {
+  const whitelist = await readSkillWhitelist();
+  return Promise.all(
+    recommended.map(async (item) => {
+      const kind: SkillKind = item.kind || (recommendedToolNames.has(item.name) ? "tool" : "skill");
+      const url = item.name.includes("/") ? `https://github.com/${item.name}` : undefined;
+      const cloneUrl = item.name.includes("/") ? `https://github.com/${item.name}.git` : undefined;
+      const whitelisted = item.sourceType === "official" || isWhitelisted({ name: item.name, url, cloneUrl }, whitelist);
+      return {
+        kind,
+        name: item.name,
+        path: url || item.name,
+        descriptionZh: await inventoryDescription(`recommended:${item.name}`, kind, item.name, `${item.usage} ${item.purpose.join(", ")}`),
+        category: item.sourceType,
+        source: "recommended" as const,
+        safety: evaluateSkillSafety({ name: item.name, url, cloneUrl, kind, whitelisted }),
+        whitelisted,
+        url,
+        cloneUrl,
+        enabled: item.enabled,
+        purpose: item.purpose
+      };
+    })
+  );
+}
+
+function extractPythonDocstring(content: string) {
+  const moduleDoc = content.match(/^\s*(?:#![^\n]*\n)?(?:#.*\n|\s)*("""|''')([\s\S]*?)\1/);
+  if (moduleDoc?.[2]) return moduleDoc[2];
+  const classOrFunctionDoc = content.match(/(?:class|def)\s+\w+[\s\S]{0,400}?(?:"""|''')([\s\S]*?)(?:"""|''')/);
+  return classOrFunctionDoc?.[1] ?? "";
+}
+
+async function readFileIfExists(file: string) {
+  try {
+    return await fs.readFile(file, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+async function descriptionFromToolPath(toolPath: string) {
+  let stat: { isDirectory: () => boolean; isFile: () => boolean };
+  try {
+    stat = await fs.stat(toolPath);
+  } catch {
+    return "";
+  }
+
+  if (stat.isFile() && toolPath.toLowerCase().endsWith(".py")) {
+    return extractPythonDocstring(await readFileIfExists(toolPath));
+  }
+  if (!stat.isDirectory()) return "";
+
+  const candidates = ["README.md", "readme.md", "tool.py", "__init__.py", "main.py", "backend.py"];
+  for (const candidate of candidates) {
+    const candidatePath = path.join(toolPath, candidate);
+    const content = await readFileIfExists(candidatePath);
+    if (!content) continue;
+    if (candidate.toLowerCase().endsWith(".py")) {
+      const docstring = extractPythonDocstring(content);
+      if (docstring) return docstring;
+    } else {
+      const sentence = firstDescriptionSentence(content);
+      if (sentence) return sentence;
+    }
+  }
+  return "";
+}
+
+export async function getSkillsInventory(recommended: RecommendedSkillSource[] = []): Promise<SkillInventoryResponse> {
+  const whitelist = await readSkillWhitelist();
+
+  const recommendedItems = await recommendedInventoryItems(recommended);
+
+  const skillFiles = [
+    ...(await findSkillFiles(path.join(hermesRoot(), "skills"))),
+    ...(await findSkillFiles(path.join(hermesRoot(), "optional-skills")))
+  ];
+  const installedSkills = await Promise.all(
+    skillFiles.map(async (file) => {
+      const content = await fs.readFile(file, "utf8");
+      const folderName = path.basename(path.dirname(file));
+      const name = titleFromSkill(content, folderName);
+      const whitelisted = isWhitelisted({ name }, whitelist);
+      return {
+        kind: "skill" as const,
+        name,
+        path: file,
+        descriptionZh: await inventoryDescription(`skill-v2:${file}`, "skill", name, descriptionFromSkill(content)),
+        category: categoryFromSkillPath(file),
+        source: sourceFromPath(file),
+        safety: evaluateSkillSafety({ name, url: file, cloneUrl: file, kind: "skill", whitelisted }),
+        whitelisted
+      };
+    })
+  );
+
+  const toolRoot = path.join(hermesRoot(), "tools");
+  const toolFiles = await findPythonToolFiles(toolRoot);
+
+  const installedTools = await Promise.all(
+    toolFiles
+      .map(async (toolPath) => {
+        const name = nameFromToolPath(toolRoot, toolPath);
+        const whitelisted = isWhitelisted({ name }, whitelist);
+        return {
+          kind: "tool" as const,
+          name,
+          path: toolPath,
+          descriptionZh: await inventoryDescription(`tool-v2:${toolPath}`, "tool", name, await descriptionFromToolPath(toolPath)),
+          category: categoryFromToolPath(toolRoot, toolPath),
+          source: "tool" as const,
+          safety: evaluateSkillSafety({ name, url: toolPath, cloneUrl: toolPath, kind: "tool", whitelisted }),
+          whitelisted
+        };
+      })
+  );
+
+  return {
+    recommendedSkills: recommendedItems.filter((item) => item.kind === "skill"),
+    recommendedTools: recommendedItems.filter((item) => item.kind === "tool"),
+    installedSkills,
+    installedTools
+  };
+}
+
+export async function readSkillsInventoryCache(cacheKey = "global"): Promise<SkillInventoryResponse> {
+  return readJsonFile<SkillInventoryResponse>(inventoryCacheFile(cacheKey), emptySkillsInventory());
+}
+
+export async function refreshSkillsInventoryCache(recommended: RecommendedSkillSource[] = [], cacheKey = "global"): Promise<SkillInventoryResponse> {
+  const inventory = await getSkillsInventory(recommended);
+  await writeJsonFile(inventoryCacheFile(cacheKey), inventory);
+  return inventory;
+}
+
+export async function readSkillsInventoryWithRecommendations(recommended: RecommendedSkillSource[] = []): Promise<SkillInventoryResponse> {
+  const cached = await readSkillsInventoryCache("global");
+  const recommendedItems = await recommendedInventoryItems(recommended);
+  return {
+    recommendedSkills: recommendedItems.filter((item) => item.kind === "skill"),
+    recommendedTools: recommendedItems.filter((item) => item.kind === "tool"),
+    installedSkills: cached.installedSkills,
+    installedTools: cached.installedTools
+  };
+}
+
+export async function refreshGlobalSkillsInventoryCache(): Promise<SkillInventoryResponse> {
+  const inventory = await getSkillsInventory([]);
+  await writeJsonFile(inventoryCacheFile("global"), inventory);
+  return inventory;
+}
