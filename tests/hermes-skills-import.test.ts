@@ -110,4 +110,31 @@ describe("/api/hermes/skills/import whitelist policy", () => {
     expect(payload.error).toContain("未通过安全检查");
     expect(execFile).not.toHaveBeenCalled();
   });
+
+  it("does not install a request identifier that differs from the whitelisted source", async () => {
+    const { addSkillWhitelist } = await import("@/lib/hermes/control");
+    await addSkillWhitelist({
+      name: "community/example-skills",
+      url: "https://github.com/community/example-skills",
+      cloneUrl: "https://github.com/community/example-skills.git",
+      kind: "skill"
+    });
+
+    const response = await postImport({
+      name: "community/example-skills",
+      url: "https://github.com/community/example-skills",
+      cloneUrl: "https://github.com/community/example-skills.git",
+      identifier: "attacker/unsafe-skills"
+    });
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(payload.identifier).toBe("community/example-skills");
+    expect(execFile).toHaveBeenCalledWith(
+      "python",
+      ["-m", "hermes_cli.main", "skills", "install", "community/example-skills", "--category", "imported", "--yes"],
+      expect.objectContaining({ cwd: tempRoot }),
+      expect.any(Function)
+    );
+  });
 });

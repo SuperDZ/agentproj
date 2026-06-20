@@ -10,6 +10,18 @@ afterEach(() => {
 });
 
 describe("Hermes real adapter", () => {
+  it("defaults to real mode and fails fast when the API base URL is missing", async () => {
+    delete process.env.HERMES_MODE;
+    delete process.env.HERMES_API_BASE_URL;
+
+    await expect(hermesClient.createResearchRun({
+      projectId: "p1",
+      idea: "SpecFlow",
+      industry: "devtools",
+      targetUser: "PMs"
+    })).rejects.toThrow("HERMES_API_BASE_URL is required for real mode.");
+  });
+
   it("creates an external research run without requiring immediate output", async () => {
     process.env.HERMES_MODE = "real";
     process.env.HERMES_API_BASE_URL = "https://hermes.example";

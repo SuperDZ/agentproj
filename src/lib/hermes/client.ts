@@ -1,10 +1,12 @@
 import { createFallbackPlanningOutput, createMockEvaluationOutput, createMockResearchRun, getMockEvents } from "./mock";
 import { parseHermesResearchOutput } from "./parser";
 import type { CreatePlanningRunInput, CreateResearchRunInput, HermesEvaluationInput, HermesEvaluationOutput, HermesEvent, HermesMode, HermesPlanningOutput, HermesRunResult, HermesRunStatus } from "./types";
+import { finishSpan, logEvent, recordMetric, startSpan } from "@/lib/observability";
 
 function hermesMode(): HermesMode {
+  if (process.env.HERMES_MODE === "mock") return "mock";
   if (process.env.HERMES_MODE === "local") return "local";
-  return process.env.HERMES_MODE === "real" && Boolean(process.env.HERMES_API_BASE_URL) ? "real" : "mock";
+  return "real";
 }
 
 async function hermesFetch(path: string, init?: RequestInit) {
@@ -46,7 +48,51 @@ function normalizeStatus(status: unknown, hasOutput: boolean): HermesRunStatus {
   return hasOutput ? "completed" : "queued";
 }
 
-function normalizeRunResponse(response: Record<string, unknown>, fallbackRunId?: string): HermesRunResult {
+function resourceUsageFromResponse(response: Record<string, unknown>, input?: CreateResearchRunInput): HermesRunResult["resourceUsage"] {
+  const raw = response.resourceUsage ?? response.resource_usage ?? response.skillToolUsage ?? response.skill_tool_usage ?? response.usage;
+  if (!raw && !input) return undefined;
+
+  const record = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  const skills = Array.isArray(record.skills) ? record.skills : Array.isArray(response.usedSkills) ? response.usedSkills : undefined;
+  const tools = Array.isArray(record.tools) ? record.tools : Array.isArray(response.usedTools) ? response.usedTools : undefined;
+
+  type UsageResource = NonNullable<HermesRunResult["resourceUsage"]>["skills"][number];
+
+  function normalize(items: unknown, fallback: CreateResearchRunInput["enabledSkills"]): UsageResource[] {
+    if (Array.isArray(items)) {
+      return items.map((item) => {
+        if (typeof item === "string") return { name: item, callCount: 1, status: "used" as const };
+        const value = item && typeof item === "object" ? item as Record<string, unknown> : {};
+        const status: UsageResource["status"] = value.status === "planned" ? "planned" : value.status === "not_reported" ? "not_reported" : "used";
+        return {
+          name: String(value.name || value.id || value.path || "unknown"),
+          path: value.path ? String(value.path) : undefined,
+          purpose: stringArrayClean(value.purpose),
+          callCount: Number.isFinite(Number(value.callCount ?? value.calls ?? value.count)) ? Number(value.callCount ?? value.calls ?? value.count) : 1,
+          status,
+          reason: value.reason ? String(value.reason) : undefined
+        };
+      }).filter((item) => item.name && item.name !== "unknown");
+    }
+    return (fallback ?? []).map((item) => ({
+      name: item.name,
+      path: item.path,
+      purpose: item.purpose,
+      callCount: 0,
+      status: "not_reported" as const,
+      reason: input?.resourceMode === "manual" ? "已传给 Hermes，远端未返回具体调用次数。" : "Hermes 自主模式未返回具体调用次数。"
+    }));
+  }
+
+  return {
+    mode: record.mode === "auto" || input?.resourceMode === "auto" ? "auto" : "manual",
+    skills: normalize(skills, input?.resourceMode === "manual" ? input.enabledSkills : undefined),
+    tools: normalize(tools, input?.resourceMode === "manual" ? input.enabledTools : undefined),
+    raw
+  };
+}
+
+function normalizeRunResponse(response: Record<string, unknown>, fallbackRunId?: string, input?: CreateResearchRunInput): HermesRunResult {
   const output = response.output ?? response.result ?? response.rawOutput;
   const rawOutput = output ? (typeof output === "string" ? output : JSON.stringify(output, null, 2)) : JSON.stringify(response, null, 2);
   const status = normalizeStatus(response.status, Boolean(output));
@@ -56,7 +102,8 @@ function normalizeRunResponse(response: Record<string, unknown>, fallbackRunId?:
     mode: hermesMode(),
     status,
     rawOutput,
-    parsedOutput: output ? parseHermesResearchOutput(rawOutput) : undefined
+    parsedOutput: output ? parseHermesResearchOutput(rawOutput) : undefined,
+    resourceUsage: resourceUsageFromResponse(response, input)
   };
 }
 
@@ -160,49 +207,97 @@ export const hermesClient = {
 
   async createResearchRun(input: CreateResearchRunInput): Promise<HermesRunResult> {
     const mode = hermesMode();
-    if (mode === "mock") return createMockResearchRun(input);
-    if (mode === "local") {
-      const { createLocalResearchRun } = await import("./local");
-      return createLocalResearchRun(input);
+    const startedAt = Date.now();
+    const span = await startSpan({ name: "hermes.createResearchRun", projectId: input.projectId, attributes: { mode, resourceMode: input.resourceMode } });
+    try {
+      let result: HermesRunResult;
+      if (mode === "mock") {
+        result = await createMockResearchRun(input);
+      } else if (mode === "local") {
+        const { createLocalResearchRun } = await import("./local");
+        result = await createLocalResearchRun(input);
+      } else {
+        const response = await hermesFetch("/runs/research", {
+          method: "POST",
+          body: JSON.stringify({
+            input: input.resourceMode === "auto"
+              ? {
+                projectId: input.projectId,
+                idea: input.idea,
+                explanation: input.explanation,
+                industry: input.industry,
+                targetUser: input.targetUser,
+                financialSuitability: input.financialSuitability,
+                preferredTechStack: input.preferredTechStack,
+                resourceMode: "auto",
+                resourceInstruction: "Autonomously select suitable Hermes skills and tools for this research run. Do not use caller-provided manual resource configuration."
+              }
+              : input,
+            ...(input.resourceMode === "manual" ? {
+              skills: input.enabledSkills?.map((item) => item.name) ?? [],
+              tools: input.enabledTools?.map((item) => item.name) ?? []
+            } : {
+              resourceSelection: "auto"
+            }),
+            safety: { yolo: false, thirdPartySkillsReferenceOnly: true }
+          })
+        });
+        result = normalizeRunResponse(response, undefined, input);
+      }
+
+      const latencyMs = Date.now() - startedAt;
+      await finishSpan(span, { status: "ok", attributes: { mode, status: result.status, hermesRunId: result.hermesRunId, latencyMs } });
+      await recordMetric({ name: "hermes.call.latency_ms", value: latencyMs, unit: "ms", tags: { mode, operation: "createResearchRun", status: result.status } });
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await finishSpan(span, { status: "error", attributes: { mode, error: message } });
+      await logEvent({ level: "error", source: "hermes-client", eventType: "hermes.create_failed", message, projectId: input.projectId, traceId: span.traceId, metadata: { mode } });
+      throw error;
     }
-
-    const response = await hermesFetch("/runs/research", {
-      method: "POST",
-      body: JSON.stringify({
-        input,
-        skills: ["planning", "document-analysis", "competitive-research"],
-        safety: { yolo: false, thirdPartySkillsReferenceOnly: true }
-      })
-    });
-
-    return normalizeRunResponse(response);
   },
 
   async getRunResult(runId: string): Promise<HermesRunResult> {
     const mode = hermesMode();
-    if (mode === "mock" || mode === "local") {
-      return {
-        hermesRunId: runId,
-        mode,
-        status: mode === "local" ? "completed_without_output" : "completed",
-        rawOutput: JSON.stringify({ status: "completed", runId }, null, 2)
-      };
+    const startedAt = Date.now();
+    const span = await startSpan({ name: "hermes.getRunResult", attributes: { mode, runId } });
+    try {
+      let result: HermesRunResult;
+      if (mode === "mock" || mode === "local") {
+        result = {
+          hermesRunId: runId,
+          mode,
+          status: mode === "local" ? "completed_without_output" : "completed",
+          rawOutput: JSON.stringify({ status: "completed", runId }, null, 2)
+        };
+      } else {
+        const response = await hermesFetch(`/runs/${runId}`);
+        if (hasResearchOutput(response)) {
+          result = normalizeRunResponse(response, runId);
+        } else {
+          const outputPath = researchOutputPath(runId);
+          if (outputPath) {
+            const outputResponse = await hermesFetch(outputPath);
+            result = hasResearchOutput(outputResponse)
+              ? normalizeRunResponse({ ...response, ...outputResponse }, runId)
+              : normalizeRunResponse(mergeRunOutput(response, outputResponse), runId);
+          } else {
+            const eventsResponse = await hermesFetch(`/runs/${runId}/events`);
+            const eventOutput = extractOutputFromEvents(eventsResponse);
+            result = eventOutput ? normalizeRunResponse(mergeRunOutput(response, eventOutput), runId) : normalizeRunResponse(response, runId);
+          }
+        }
+      }
+      const latencyMs = Date.now() - startedAt;
+      await finishSpan(span, { status: "ok", attributes: { mode, runId, status: result.status, latencyMs } });
+      await recordMetric({ name: "hermes.call.latency_ms", value: latencyMs, unit: "ms", tags: { mode, operation: "getRunResult", status: result.status } });
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await finishSpan(span, { status: "error", attributes: { mode, runId, error: message } });
+      await logEvent({ level: "error", source: "hermes-client", eventType: "hermes.refresh_failed", message, traceId: span.traceId, metadata: { mode, runId } });
+      throw error;
     }
-    const response = await hermesFetch(`/runs/${runId}`);
-    if (hasResearchOutput(response)) return normalizeRunResponse(response, runId);
-
-    const outputPath = researchOutputPath(runId);
-    if (outputPath) {
-      const outputResponse = await hermesFetch(outputPath);
-      if (hasResearchOutput(outputResponse)) return normalizeRunResponse({ ...response, ...outputResponse }, runId);
-      return normalizeRunResponse(mergeRunOutput(response, outputResponse), runId);
-    }
-
-    const eventsResponse = await hermesFetch(`/runs/${runId}/events`);
-    const eventOutput = extractOutputFromEvents(eventsResponse);
-    if (eventOutput) return normalizeRunResponse(mergeRunOutput(response, eventOutput), runId);
-
-    return normalizeRunResponse(response, runId);
   },
 
   async evaluateReadiness(input: HermesEvaluationInput): Promise<HermesEvaluationOutput> {

@@ -4,6 +4,7 @@ export type SkillKind = "skill" | "tool";
 
 export type RecommendedSkillSource = {
   name: string;
+  kind?: SkillKind;
   sourceType: SkillSourceType;
   purpose: string[];
   usage: string;
@@ -44,7 +45,7 @@ export type SkillInventoryItem = {
   path: string;
   descriptionZh: string;
   category?: string;
-  source: "recommended" | "installed" | "imported" | "custom" | "tool";
+  source: "recommended" | "installed" | "optional" | "imported" | "custom" | "tool";
   safety: SkillSearchSafety;
   whitelisted: boolean;
   url?: string;

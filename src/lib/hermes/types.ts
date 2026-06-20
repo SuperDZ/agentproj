@@ -60,6 +60,9 @@ export type CreateResearchRunInput = {
   targetUser: string;
   financialSuitability?: boolean;
   preferredTechStack?: string;
+  resourceMode?: "manual" | "auto";
+  enabledSkills?: Array<{ name: string; path?: string; purpose?: string[]; description?: string }>;
+  enabledTools?: Array<{ name: string; path?: string; purpose?: string[]; description?: string }>;
 };
 
 export type CreatePlanningRunInput = {
@@ -68,6 +71,8 @@ export type CreatePlanningRunInput = {
   explanation?: string;
   industry: string;
   targetUser: string;
+  recommendedSkills?: Array<{ name: string; purpose?: string[] }>;
+  recommendedTools?: Array<{ name: string; purpose?: string[] }>;
 };
 
 export type HermesPlanningOutput = {
@@ -86,7 +91,7 @@ export type HermesEvaluationInput = EvaluationInput & {
 
 export type HermesEvaluationOutput = EvaluationResult;
 
-export type HermesRunStatus = "queued" | "running" | "completed" | "failed" | "completed_without_output";
+export type HermesRunStatus = "queued" | "running" | "completed" | "failed" | "completed_without_output" | "completed_with_fallback";
 export type HermesMode = "real" | "mock" | "local";
 
 export type HermesRunResult = {
@@ -95,6 +100,12 @@ export type HermesRunResult = {
   status: HermesRunStatus;
   rawOutput: string;
   parsedOutput?: HermesResearchOutput;
+  resourceUsage?: {
+    mode: "manual" | "auto";
+    skills: Array<{ name: string; path?: string; purpose?: string[]; callCount?: number; status?: "used" | "planned" | "not_reported"; reason?: string }>;
+    tools: Array<{ name: string; path?: string; purpose?: string[]; callCount?: number; status?: "used" | "planned" | "not_reported"; reason?: string }>;
+    raw?: unknown;
+  };
 };
 
 export type HermesEvent = {

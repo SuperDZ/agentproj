@@ -15,6 +15,7 @@ import type {
 const stateDir = path.join(process.cwd(), ".next", "hermes");
 const pidFile = path.join(stateDir, "dashboard.pid");
 const modelConfigFile = path.join(stateDir, "model-config.json");
+const inventoryCacheDir = path.join(process.cwd(), ".cache", "hermes", "skills-inventory-cache");
 
 export type HermesModelConfig = {
   provider: string;
@@ -107,6 +108,20 @@ function descriptionCacheFile() {
   return path.join(hermesRoot(), "skills", "zh-descriptions.json");
 }
 
+function emptySkillsInventory(): SkillInventoryResponse {
+  return {
+    recommendedSkills: [],
+    recommendedTools: [],
+    installedSkills: [],
+    installedTools: []
+  };
+}
+
+function inventoryCacheFile(cacheKey = "global") {
+  const safeKey = cacheKey.replace(/[^a-z0-9_-]+/gi, "-").replace(/^-+|-+$/g, "") || "global";
+  return path.join(inventoryCacheDir, `${safeKey}.json`);
+}
+
 function exec(command: string, args: string[], cwd = process.cwd(), timeout = 120_000) {
   return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
     execFile(command, args, { cwd, timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
@@ -117,6 +132,30 @@ function exec(command: string, args: string[], cwd = process.cwd(), timeout = 12
       resolve({ stdout: String(stdout), stderr: String(stderr) });
     });
   });
+}
+
+async function detectHermesDashboardProcesses() {
+  try {
+    const result = process.platform === "win32"
+      ? await exec("powershell.exe", [
+        "-NoProfile",
+        "-Command",
+        "$current=$PID; Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $current -and $_.CommandLine -match 'hermes_cli\\.main\\s+dashboard' } | Select-Object -ExpandProperty ProcessId"
+      ], process.cwd(), 10_000)
+      : await exec("ps", ["-eo", "pid=,args="], process.cwd(), 10_000);
+
+    const lines = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const pids = process.platform === "win32"
+      ? lines.map((line) => Number(line)).filter((pid) => Number.isInteger(pid) && pid > 0)
+      : lines
+        .filter((line) => /hermes_cli\.main\s+dashboard/.test(line))
+        .map((line) => Number(line.match(/^\d+/)?.[0]))
+        .filter((pid) => Number.isInteger(pid) && pid > 0);
+
+    return Array.from(new Set(pids));
+  } catch {
+    return [];
+  }
 }
 
 async function readJsonFile<T>(file: string, fallback: T): Promise<T> {
@@ -151,36 +190,39 @@ export async function readModelConfig(): Promise<HermesModelConfig> {
 }
 
 export async function getHermesStatus() {
-  let dashboardPid: number | undefined;
-  try {
-    const parsed = Number(await fs.readFile(pidFile, "utf8"));
-    dashboardPid = Number.isFinite(parsed) ? parsed : undefined;
-  } catch {
-    dashboardPid = undefined;
-  }
+  const recordedDashboardPid = await readDashboardPid();
+  const detectedDashboardPids = await detectHermesDashboardProcesses();
+  const dashboardPids = Array.from(new Set([
+    ...(recordedDashboardPid ? [recordedDashboardPid] : []),
+    ...detectedDashboardPids
+  ]));
+  const dashboardPid = recordedDashboardPid || detectedDashboardPids[0];
 
   const savedModelConfig = await readModelConfig();
   const pythonDiagnostics = hermesPythonDiagnostics();
   return {
-    mode: process.env.HERMES_MODE || "mock",
+    mode: process.env.HERMES_MODE || "real",
     localRoot: hermesRoot(),
     ...pythonDiagnostics,
     provider: savedModelConfig.provider || process.env.HERMES_LOCAL_PROVIDER || process.env.HERMES_INFERENCE_PROVIDER || "",
     model: savedModelConfig.model || process.env.HERMES_LOCAL_MODEL || process.env.HERMES_INFERENCE_MODEL || "",
     usageMode: savedModelConfig.usageMode,
     codexCliCommand: savedModelConfig.codexCliCommand,
-    dashboardPid
+    dashboardPid,
+    dashboardPids,
+    dashboardPidSource: recordedDashboardPid ? "pid-file" : dashboardPid ? "process-scan" : "none"
   };
 }
 
 export async function saveModelConfig(config: { provider: string; model: string; usageMode: string; codexCliCommand?: string }) {
-  await writeJsonFile(modelConfigFile, {
+  const normalized = {
     provider: stringValue(config.provider),
     model: stringValue(config.model),
     usageMode: normalizeUsageMode(config.usageMode),
     codexCliCommand: stringValue(config.codexCliCommand) || "codex"
-  });
-  return getHermesStatus();
+  };
+  await writeJsonFile(modelConfigFile, normalized);
+  return normalized;
 }
 
 function formatHermesStartupError(message: string, details: { stderr?: string; code?: number | null; signal?: NodeJS.Signals | null }) {
@@ -192,7 +234,36 @@ function formatHermesStartupError(message: string, details: { stderr?: string; c
   return new Error(`${message}${exitDetail}${stderrDetail}`);
 }
 
+function processExists(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error instanceof Error && "code" in error && error.code === "EPERM";
+  }
+}
+
+async function readDashboardPid() {
+  try {
+    const parsed = Number(await fs.readFile(pidFile, "utf8"));
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      await fs.rm(pidFile, { force: true });
+      return undefined;
+    }
+    if (!processExists(parsed)) {
+      await fs.rm(pidFile, { force: true });
+      return undefined;
+    }
+    return parsed;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function startHermesDashboard() {
+  const currentStatus = await getHermesStatus();
+  if (currentStatus.dashboardPid) return currentStatus;
+
   const root = hermesRoot();
   const python = hermesPython();
 
@@ -229,12 +300,11 @@ export async function startHermesDashboard() {
   await new Promise<void>((resolve, reject) => {
     let settled = false;
     const startupWindowMs = 750;
-    let timer: NodeJS.Timeout | undefined;
 
     const settle = (callback: () => void) => {
       if (settled) return;
       settled = true;
-      if (timer) clearTimeout(timer);
+      clearTimeout(timer);
       child.off("error", onError);
       child.off("close", onClose);
       callback();
@@ -250,11 +320,11 @@ export async function startHermesDashboard() {
       settle(() => reject(formatHermesStartupError("Hermes dashboard exited during startup.", { stderr, code, signal })));
     };
 
-    child.once("error", onError);
-    child.once("close", onClose);
-    timer = setTimeout(() => {
+    const timer = setTimeout(() => {
       settle(() => resolve());
     }, startupWindowMs);
+    child.once("error", onError);
+    child.once("close", onClose);
   });
 
   const stderrPipe = child.stderr as (NodeJS.ReadableStream & { unref?: () => void }) | null;
@@ -271,9 +341,10 @@ export async function startHermesDashboard() {
 
 export async function stopHermesDashboard() {
   const status = await getHermesStatus();
-  if (status.dashboardPid) {
+  for (const pid of status.dashboardPids) {
+    if (!processExists(pid)) continue;
     try {
-      process.kill(status.dashboardPid);
+      process.kill(pid);
     } catch {
       // 进程可能已经退出。
     }
@@ -428,16 +499,25 @@ function githubRepoFromUrl(value?: string) {
   return `${match[1]}/${match[2]}`;
 }
 
+function githubRepoFromIdentifier(value?: string) {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const repoFromUrl = githubRepoFromUrl(trimmed);
+  if (repoFromUrl) return repoFromUrl;
+  const match = trimmed.match(/^([^/\s]+)\/([^/\s]+)(?:\/[^\s]+)?$/);
+  return match ? `${match[1]}/${match[2]}` : undefined;
+}
+
 export function resolveSkillImportSource(input: ImportGithubSkillInput): SkillImportSource {
   const name = input.name?.trim();
   const url = input.url?.trim();
   const cloneUrl = input.cloneUrl?.trim();
   const identifier = input.identifier?.trim();
 
-  const repoFromIdentifier = githubRepoFromUrl(identifier);
+  const repoFromIdentifier = githubRepoFromIdentifier(identifier);
   const repoFromUrl = githubRepoFromUrl(url);
   const repoFromClone = githubRepoFromUrl(cloneUrl);
-  const repo = repoFromUrl || repoFromClone || repoFromIdentifier || (identifier?.match(/^[^/\s]+\/[^/\s]+(?:\/[^\s]+)?$/) ? identifier.split("/").slice(0, 2).join("/") : undefined);
+  const repo = repoFromUrl || repoFromClone || repoFromIdentifier;
 
   return {
     name: repo || name,
@@ -458,6 +538,21 @@ export async function assertSkillImportWhitelisted(input: ImportGithubSkillInput
     throw new SkillImportForbiddenError();
   }
   return source;
+}
+
+function trustedInstallInput(input: ImportGithubSkillInput, source: SkillImportSource): ImportGithubSkillInput {
+  const url = source.url;
+  const repo = githubRepoFromUrl(url) || githubRepoFromUrl(source.cloneUrl) || githubRepoFromIdentifier(source.name);
+  const identifier = url?.match(/^https?:\/\/.+\.md(?:[?#].*)?$/i)
+    ? url
+    : repo || source.name;
+
+  return {
+    name: source.name || input.name,
+    url: source.url,
+    cloneUrl: source.cloneUrl,
+    identifier
+  };
 }
 
 function githubApiHeaders() {
@@ -502,8 +597,8 @@ async function installSkillWithHermes(input: ImportGithubSkillInput) {
 }
 
 export async function importGithubSkill(input: ImportGithubSkillInput) {
-  await assertSkillImportWhitelisted(input);
-  return installSkillWithHermes(input);
+  const source = await assertSkillImportWhitelisted(input);
+  return installSkillWithHermes(trustedInstallInput(input, source));
 }
 
 async function importGithubSkillLegacyClone(cloneUrl: string, name: string) {
@@ -603,9 +698,50 @@ void descriptionZh;
 
 function sourceFromPath(filePath: string): SkillInventoryItem["source"] {
   const normalized = filePath.toLowerCase();
+  if (normalized.includes(`${path.sep}optional-skills${path.sep}`)) return "optional";
   if (normalized.includes(`${path.sep}imported${path.sep}`)) return "imported";
   if (normalized.includes(`${path.sep}custom${path.sep}`)) return "custom";
   return "installed";
+}
+
+async function findPythonToolFiles(root: string): Promise<string[]> {
+  let entries: Array<{ name: string; isFile: () => boolean; isDirectory: () => boolean }>;
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const found: string[] = [];
+  for (const entry of entries) {
+    if (entry.name === ".git" || entry.name === "__pycache__" || entry.name === "node_modules") continue;
+    const fullPath = path.join(root, entry.name);
+    if (entry.isFile() && entry.name.endsWith(".py")) {
+      found.push(fullPath);
+    } else if (entry.isDirectory()) {
+      found.push(...(await findPythonToolFiles(fullPath)));
+    }
+  }
+  return found;
+}
+
+function categoryFromSkillPath(file: string) {
+  const root = path.resolve(hermesRoot());
+  const relative = path.relative(root, file);
+  const parts = relative.split(path.sep);
+  if (parts[0] === "optional-skills") return `optional/${parts[1] || "uncategorized"}`;
+  if (parts[0] === "skills") return parts[1] || "uncategorized";
+  return path.basename(path.dirname(path.dirname(file)));
+}
+
+function nameFromToolPath(toolRoot: string, toolPath: string) {
+  const relative = path.relative(toolRoot, toolPath).replace(/\\/g, "/").replace(/\.py$/i, "");
+  return relative || path.basename(toolPath).replace(/\.py$/i, "");
+}
+
+function categoryFromToolPath(toolRoot: string, toolPath: string) {
+  const relativeDir = path.dirname(path.relative(toolRoot, toolPath));
+  return relativeDir === "." ? "python" : relativeDir.replace(/\\/g, "/");
 }
 
 function normalizeDescriptionText(value: string) {
@@ -657,6 +793,32 @@ async function inventoryDescription(key: string, kind: SkillKind, name: string, 
   return value;
 }
 
+async function recommendedInventoryItems(recommended: RecommendedSkillSource[] = []) {
+  const whitelist = await readSkillWhitelist();
+  return Promise.all(
+    recommended.map(async (item) => {
+      const kind: SkillKind = item.kind || (recommendedToolNames.has(item.name) ? "tool" : "skill");
+      const url = item.name.includes("/") ? `https://github.com/${item.name}` : undefined;
+      const cloneUrl = item.name.includes("/") ? `https://github.com/${item.name}.git` : undefined;
+      const whitelisted = item.sourceType === "official" || isWhitelisted({ name: item.name, url, cloneUrl }, whitelist);
+      return {
+        kind,
+        name: item.name,
+        path: url || item.name,
+        descriptionZh: await inventoryDescription(`recommended:${item.name}`, kind, item.name, `${item.usage} ${item.purpose.join(", ")}`),
+        category: item.sourceType,
+        source: "recommended" as const,
+        safety: evaluateSkillSafety({ name: item.name, url, cloneUrl, kind, whitelisted }),
+        whitelisted,
+        url,
+        cloneUrl,
+        enabled: item.enabled,
+        purpose: item.purpose
+      };
+    })
+  );
+}
+
 function extractPythonDocstring(content: string) {
   const moduleDoc = content.match(/^\s*(?:#![^\n]*\n)?(?:#.*\n|\s)*("""|''')([\s\S]*?)\1/);
   if (moduleDoc?.[2]) return moduleDoc[2];
@@ -704,30 +866,12 @@ async function descriptionFromToolPath(toolPath: string) {
 export async function getSkillsInventory(recommended: RecommendedSkillSource[] = []): Promise<SkillInventoryResponse> {
   const whitelist = await readSkillWhitelist();
 
-  const recommendedItems = await Promise.all(
-    recommended.map(async (item) => {
-      const kind: SkillKind = recommendedToolNames.has(item.name) ? "tool" : "skill";
-      const url = item.name.includes("/") ? `https://github.com/${item.name}` : undefined;
-      const cloneUrl = item.name.includes("/") ? `https://github.com/${item.name}.git` : undefined;
-      const whitelisted = item.sourceType === "official" || isWhitelisted({ name: item.name, url, cloneUrl }, whitelist);
-      return {
-        kind,
-        name: item.name,
-        path: url || item.name,
-        descriptionZh: await inventoryDescription(`recommended:${item.name}`, kind, item.name, `${item.usage} ${item.purpose.join(", ")}`),
-        category: item.sourceType,
-        source: "recommended" as const,
-        safety: evaluateSkillSafety({ name: item.name, url, cloneUrl, kind, whitelisted }),
-        whitelisted,
-        url,
-        cloneUrl,
-        enabled: item.enabled,
-        purpose: item.purpose
-      };
-    })
-  );
+  const recommendedItems = await recommendedInventoryItems(recommended);
 
-  const skillFiles = await findSkillFiles(path.join(hermesRoot(), "skills"));
+  const skillFiles = [
+    ...(await findSkillFiles(path.join(hermesRoot(), "skills"))),
+    ...(await findSkillFiles(path.join(hermesRoot(), "optional-skills")))
+  ];
   const installedSkills = await Promise.all(
     skillFiles.map(async (file) => {
       const content = await fs.readFile(file, "utf8");
@@ -739,7 +883,7 @@ export async function getSkillsInventory(recommended: RecommendedSkillSource[] =
         name,
         path: file,
         descriptionZh: await inventoryDescription(`skill-v2:${file}`, "skill", name, descriptionFromSkill(content)),
-        category: path.basename(path.dirname(path.dirname(file))),
+        category: categoryFromSkillPath(file),
         source: sourceFromPath(file),
         safety: evaluateSkillSafety({ name, url: file, cloneUrl: file, kind: "skill", whitelisted }),
         whitelisted
@@ -747,26 +891,20 @@ export async function getSkillsInventory(recommended: RecommendedSkillSource[] =
     })
   );
 
-  let toolEntries: Array<{ name: string; isFile: () => boolean; isDirectory: () => boolean }> = [];
-  try {
-    toolEntries = await fs.readdir(path.join(hermesRoot(), "tools"), { withFileTypes: true });
-  } catch {
-    toolEntries = [];
-  }
+  const toolRoot = path.join(hermesRoot(), "tools");
+  const toolFiles = await findPythonToolFiles(toolRoot);
 
   const installedTools = await Promise.all(
-    toolEntries
-      .filter((entry) => entry.name !== "__pycache__" && ((entry.isFile() && entry.name.endsWith(".py")) || entry.isDirectory()))
-      .map(async (entry) => {
-        const toolPath = path.join(hermesRoot(), "tools", entry.name);
-        const name = entry.name.replace(/\.py$/i, "");
+    toolFiles
+      .map(async (toolPath) => {
+        const name = nameFromToolPath(toolRoot, toolPath);
         const whitelisted = isWhitelisted({ name }, whitelist);
         return {
           kind: "tool" as const,
           name,
           path: toolPath,
           descriptionZh: await inventoryDescription(`tool-v2:${toolPath}`, "tool", name, await descriptionFromToolPath(toolPath)),
-          category: entry.isDirectory() ? "directory" : "python",
+          category: categoryFromToolPath(toolRoot, toolPath),
           source: "tool" as const,
           safety: evaluateSkillSafety({ name, url: toolPath, cloneUrl: toolPath, kind: "tool", whitelisted }),
           whitelisted
@@ -780,4 +918,31 @@ export async function getSkillsInventory(recommended: RecommendedSkillSource[] =
     installedSkills,
     installedTools
   };
+}
+
+export async function readSkillsInventoryCache(cacheKey = "global"): Promise<SkillInventoryResponse> {
+  return readJsonFile<SkillInventoryResponse>(inventoryCacheFile(cacheKey), emptySkillsInventory());
+}
+
+export async function refreshSkillsInventoryCache(recommended: RecommendedSkillSource[] = [], cacheKey = "global"): Promise<SkillInventoryResponse> {
+  const inventory = await getSkillsInventory(recommended);
+  await writeJsonFile(inventoryCacheFile(cacheKey), inventory);
+  return inventory;
+}
+
+export async function readSkillsInventoryWithRecommendations(recommended: RecommendedSkillSource[] = []): Promise<SkillInventoryResponse> {
+  const cached = await readSkillsInventoryCache("global");
+  const recommendedItems = await recommendedInventoryItems(recommended);
+  return {
+    recommendedSkills: recommendedItems.filter((item) => item.kind === "skill"),
+    recommendedTools: recommendedItems.filter((item) => item.kind === "tool"),
+    installedSkills: cached.installedSkills,
+    installedTools: cached.installedTools
+  };
+}
+
+export async function refreshGlobalSkillsInventoryCache(): Promise<SkillInventoryResponse> {
+  const inventory = await getSkillsInventory([]);
+  await writeJsonFile(inventoryCacheFile("global"), inventory);
+  return inventory;
 }

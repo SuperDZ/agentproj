@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { handleApiError } from "@/lib/api/errors";
 import { hermesClient } from "@/lib/hermes/client";
 import type { HermesEvent } from "@/lib/hermes/types";
-import { loadProjectFlowData, startProjectResearch } from "@/lib/services/project-flow";
+import { loadProjectFlowData, runProjectResearch } from "@/lib/services/project-flow";
 
 export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -38,7 +38,8 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
 export async function POST(_: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params;
-    const run = await startProjectResearch(id);
+    const run = await runProjectResearch(id);
+    if (!run) throw new Error("Research run was not created or advanced.");
     return NextResponse.json({
       ok: true,
       id: run.id,

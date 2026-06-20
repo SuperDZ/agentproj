@@ -3,10 +3,12 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { prisma } from "@/lib/db/prisma";
+import { deleteProjectStoredArtifacts } from "@/lib/artifacts/store";
 import { demoIdea } from "@/lib/mock/demo";
 import { createProjectSchema, projectNameFromIdea } from "@/lib/project-schema";
 import {
   createProjectMonitorJob,
+  createProjectSkillToolRecommendations,
   evaluateProjectById,
   exportProjectCodexPack,
   generateInitialProjectPlanningWithHermes,
@@ -64,14 +66,23 @@ export async function createProject(formData: FormData) {
     });
   }
   await prisma.generatedArtifact.create({ data: { projectId: project.id, artifactType: "model_config", content: JSON.stringify(input.modelConfig) } });
+  await createProjectSkillToolRecommendations(project.id);
   await generateInitialProjectPlanningWithHermes(project.id);
   redirect(`/projects/${project.id}`);
 }
 
 export async function createDemoProject() {
   const project = await prisma.project.create({ data: { ...demoIdea, status: "demo" } });
+  await createProjectSkillToolRecommendations(project.id);
   await generateInitialProjectPlanningWithHermes(project.id);
   redirect(`/projects/${project.id}`);
+}
+
+export async function deleteProject(projectId: string) {
+  await deleteProjectStoredArtifacts(projectId);
+  await prisma.project.delete({ where: { id: projectId } });
+  revalidatePath("/");
+  revalidatePath("/projects");
 }
 
 export async function saveReportAssistant(projectId: string, formData: FormData) {

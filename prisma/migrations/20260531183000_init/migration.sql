@@ -6,8 +6,8 @@ CREATE TABLE "Project" (
     "industry" TEXT NOT NULL,
     "targetUser" TEXT NOT NULL,
     "status" TEXT NOT NULL DEFAULT 'draft',
-    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- CreateTable
@@ -20,8 +20,8 @@ CREATE TABLE "ResearchRun" (
     "inputPrompt" TEXT NOT NULL,
     "rawOutput" TEXT,
     "parsedOutputJson" TEXT,
-    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "completedAt" DATETIME,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "completedAt" TIMESTAMP(3),
     CONSTRAINT "ResearchRun_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project" ("id") ON DELETE CASCADE ON UPDATE CASCADE
 );
 
@@ -39,7 +39,7 @@ CREATE TABLE "Competitor" (
     "reusableIdeasJson" TEXT NOT NULL,
     "threatLevel" INTEGER NOT NULL,
     "reuseStrategy" TEXT NOT NULL,
-    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT "Competitor_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project" ("id") ON DELETE CASCADE ON UPDATE CASCADE
 );
 
@@ -47,7 +47,7 @@ CREATE TABLE "Competitor" (
 CREATE TABLE "Evaluation" (
     "id" TEXT NOT NULL PRIMARY KEY,
     "projectId" TEXT NOT NULL,
-    "pdrs" REAL NOT NULL,
+    "pdrs" DOUBLE PRECISION NOT NULL,
     "opportunityScore" INTEGER NOT NULL,
     "competitiveScore" INTEGER NOT NULL,
     "specificationScore" INTEGER NOT NULL,
@@ -58,7 +58,7 @@ CREATE TABLE "Evaluation" (
     "decision" TEXT NOT NULL,
     "risksJson" TEXT NOT NULL,
     "nextActionsJson" TEXT NOT NULL,
-    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT "Evaluation_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project" ("id") ON DELETE CASCADE ON UPDATE CASCADE
 );
 
@@ -69,7 +69,7 @@ CREATE TABLE "GeneratedArtifact" (
     "artifactType" TEXT NOT NULL,
     "content" TEXT NOT NULL,
     "version" INTEGER NOT NULL DEFAULT 1,
-    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT "GeneratedArtifact_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project" ("id") ON DELETE CASCADE ON UPDATE CASCADE
 );
 
@@ -80,9 +80,9 @@ CREATE TABLE "MonitorJob" (
     "hermesCronJobId" TEXT,
     "schedule" TEXT NOT NULL,
     "status" TEXT NOT NULL DEFAULT 'active',
-    "lastRunAt" DATETIME,
-    "nextRunAt" DATETIME,
-    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "lastRunAt" TIMESTAMP(3),
+    "nextRunAt" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT "MonitorJob_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project" ("id") ON DELETE CASCADE ON UPDATE CASCADE
 );
 
@@ -95,7 +95,7 @@ CREATE TABLE "MonitorReport" (
     "summary" TEXT NOT NULL,
     "alertsJson" TEXT NOT NULL,
     "recommendedActionsJson" TEXT NOT NULL,
-    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT "MonitorReport_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
     CONSTRAINT "MonitorReport_jobId_fkey" FOREIGN KEY ("jobId") REFERENCES "MonitorJob" ("id") ON DELETE CASCADE ON UPDATE CASCADE
 );

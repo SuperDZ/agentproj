@@ -1,3 +1,5 @@
+import { recordModelInvocation } from "@/lib/observability";
+
 export type ModelConfig = {
   provider?: string;
   model?: string;
@@ -38,18 +40,35 @@ export async function generateJsonWithModel<T>({
   system,
   user,
   config,
-  fallback
+  fallback,
+  projectId,
+  traceId
 }: {
   system: string;
   user: string;
   config?: ModelConfig;
   fallback: T;
+  projectId?: string;
+  traceId?: string;
 }): Promise<T> {
   if (config?.usageMode === "codex-cli") return fallback;
 
   const provider = (config?.provider || process.env.HERMES_INFERENCE_PROVIDER || "deepseek").toLowerCase();
+  const model = config?.model || process.env.HERMES_INFERENCE_MODEL || defaultModel(provider);
+  const startedAt = Date.now();
   const apiKey = keyFor(provider);
-  if (!apiKey) return fallback;
+  if (!apiKey) {
+    await recordModelInvocation({
+      provider,
+      model,
+      latencyMs: Date.now() - startedAt,
+      status: "fallback",
+      projectId,
+      traceId,
+      error: "Missing API key."
+    });
+    return fallback;
+  }
 
   const messages: ChatMessage[] = [
     { role: "system", content: system },
@@ -64,19 +83,54 @@ export async function generateJsonWithModel<T>({
         authorization: `Bearer ${apiKey}`
       },
       body: JSON.stringify({
-        model: config?.model || process.env.HERMES_INFERENCE_MODEL || defaultModel(provider),
+        model,
         messages,
         temperature: 0.2,
         response_format: { type: "json_object" }
       })
     });
 
-    if (!response.ok) return fallback;
-    const payload = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    if (!response.ok) {
+      await recordModelInvocation({
+        provider,
+        model,
+        latencyMs: Date.now() - startedAt,
+        status: "fallback",
+        projectId,
+        traceId,
+        error: `HTTP ${response.status}`
+      });
+      return fallback;
+    }
+    const payload = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+    };
     const content = payload.choices?.[0]?.message?.content;
+    await recordModelInvocation({
+      provider,
+      model,
+      promptTokens: payload.usage?.prompt_tokens,
+      completionTokens: payload.usage?.completion_tokens,
+      totalTokens: payload.usage?.total_tokens,
+      estimatedCostUsd: null,
+      latencyMs: Date.now() - startedAt,
+      status: content ? "ok" : "fallback",
+      projectId,
+      traceId
+    });
     if (!content) return fallback;
     return JSON.parse(extractJson(content)) as T;
-  } catch {
+  } catch (error) {
+    await recordModelInvocation({
+      provider,
+      model,
+      latencyMs: Date.now() - startedAt,
+      status: "fallback",
+      projectId,
+      traceId,
+      error: error instanceof Error ? error.message : String(error)
+    });
     return fallback;
   }
 }

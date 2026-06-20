@@ -1,6 +1,33 @@
 "use client";
 
 import { createProject } from "@/app/actions";
+import { buttonStyles, fieldStyles } from "@/components/ui";
+import { useFormStatus } from "react-dom";
+
+function CreateProjectProgress() {
+  const { pending } = useFormStatus();
+  if (!pending) return null;
+
+  return (
+    <div className="rounded-lg border border-teal-200 bg-teal-50 p-3 text-sm leading-6 text-teal-900">
+      <div className="flex items-center gap-2">
+        <span className="h-2 w-2 animate-pulse rounded-full bg-teal-700" />
+        <span className="font-semibold">正在创建项目</span>
+      </div>
+      <p className="mt-1 text-xs">系统正在保存项目、写入初始配置，并生成产品规划建议。完成后会自动进入项目工作台。</p>
+    </div>
+  );
+}
+
+function CreateProjectButton() {
+  const { pending } = useFormStatus();
+
+  return (
+    <button disabled={pending} className={buttonStyles.primary}>
+      {pending ? "创建中..." : "创建项目"}
+    </button>
+  );
+}
 
 export function ProjectIntakeForm() {
   return (
@@ -15,44 +42,40 @@ export function ProjectIntakeForm() {
 
       <section className="grid gap-3">
         <div>
-          <p className="text-sm font-semibold text-zinc-950">项目命题</p>
-          <p className="mt-1 text-xs leading-5 text-zinc-500">
-            只输入你希望模型处理的命题。系统会先生成产品经理视角规划建议和汇报展示助手初稿，后续研究由你确认后触发。
-          </p>
+          <p className="text-sm font-bold text-stone-950">项目命题</p>
+          <p className="mt-1 text-xs leading-5 text-stone-500">只输入希望系统处理的产品命题。系统会先生成产品经理视角的规划建议，后续调研由你确认后触发。</p>
         </div>
         <textarea
           required
           name="idea"
           rows={4}
-          className="rounded-lg border border-zinc-300 bg-white p-3 text-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
-          placeholder="例如：为客户经理设计一个 AI 财富产品推荐与适当性审核系统"
+          className={`${fieldStyles} min-h-32 p-3`}
+          placeholder="例如：为客户经理设计一个 AI 财富产品推荐与适当性审核系统。"
         />
       </section>
 
       <section className="grid gap-3">
         <div>
-          <p className="text-sm font-semibold text-zinc-950">补充解释</p>
-          <p className="mt-1 text-xs leading-5 text-zinc-500">
-            写明背景、约束、目标用户、业务目标、风险或面试输出要求。技术栈会在 PRD（产品需求文档）生成后再建议。
-          </p>
+          <p className="text-sm font-bold text-stone-950">补充解释</p>
+          <p className="mt-1 text-xs leading-5 text-stone-500">写明背景、约束、目标用户、业务目标、风险或输出要求。技术栈会在 PRD 生成后再建议。</p>
         </div>
         <textarea
           name="ideaExplanation"
           rows={7}
-          className="rounded-lg border border-zinc-300 bg-white p-3 text-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
-          placeholder="例如：面试时间 90 分钟，需要输出问题发现、需求定义、核心 3-5 个功能点、PRD、原型说明、路演大纲和可交给 Codex 的实现计划。"
+          className={`${fieldStyles} min-h-44 p-3`}
+          placeholder="例如：面试时间 90 分钟，需要输出问题发现、需求定义、核心 3-5 个功能点、PRD、原型说明和可交给 Codex 的实现计划。"
         />
       </section>
 
-      <div className="grid gap-2 rounded-lg border border-blue-100 bg-blue-50/50 p-4 text-sm leading-6 text-zinc-700">
-        <p className="font-semibold text-zinc-950">创建后的流程</p>
-        <p>创建后只生成项目规划建议和汇报展示助手初稿。你确认问题与用户、3-5 个核心功能后，才能运行 Hermes（智能体运行框架）研究。</p>
+      <div className="grid gap-2 rounded-lg border border-teal-100 bg-teal-50/70 p-4 text-sm leading-6 text-stone-700">
+        <p className="font-bold text-stone-950">创建后的流程</p>
+        <p>创建后只生成项目规划建议和汇报展示助手初稿。确认问题、用户和 3-5 个核心功能后，才运行 Hermes 调研。</p>
       </div>
 
-      <div className="flex justify-end border-t border-zinc-200 pt-5">
-        <button className="rounded-lg bg-zinc-950 px-5 py-3 text-sm font-semibold text-white hover:bg-zinc-800">
-          创建项目
-        </button>
+      <CreateProjectProgress />
+
+      <div className="flex justify-end border-t border-stone-200 pt-5">
+        <CreateProjectButton />
       </div>
     </form>
   );

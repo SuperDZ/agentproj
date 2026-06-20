@@ -25,7 +25,8 @@ const fallbackText = {
   running: "执行中...",
   failed: "执行失败",
   failedDetail: "操作失败。",
-  completed: "已完成"
+  completed: "已完成",
+  submitted: "已提交后台运行"
 };
 
 export function WorkflowActionButton({ label, endpoint, stages, className, pollEndpoint, disabled, disabledReason, background }: WorkflowActionButtonProps) {
@@ -40,11 +41,11 @@ export function WorkflowActionButton({ label, endpoint, stages, className, pollE
       const response = await fetch(pollEndpoint, { cache: "no-store" });
       const payload = await response.json();
 
-      if (payload.status === "failed") {
+      if (payload.status === "failed" || payload.status === "completed_without_output") {
         throw new Error(payload.refreshError || payload.eventsError || "任务执行失败。");
       }
 
-      if (payload.status === "completed" && payload.hasParsedOutput) return;
+      if ((payload.status === "completed" && payload.hasParsedOutput) || payload.status === "completed_with_fallback") return;
 
       setState({ phase: "running", stage: `等待结果同步 ${attempt + 1}/12` });
       await new Promise((resolve) => window.setTimeout(resolve, 1800));
@@ -69,7 +70,7 @@ export function WorkflowActionButton({ label, endpoint, stages, className, pollE
       if (!response.ok) throw new Error(payload.error || payload.message || fallbackText.failedDetail);
 
       if (background) {
-        setState({ phase: "success", stage: "已提交后台运行" });
+        setState({ phase: "success", stage: fallbackText.submitted });
         startTransition(() => router.refresh());
         return;
       }
@@ -94,11 +95,11 @@ export function WorkflowActionButton({ label, endpoint, stages, className, pollE
       <button type="button" onClick={run} disabled={disabled || state.phase === "running"} className={className}>
         {state.phase === "running" ? fallbackText.running : label}
       </button>
-      {disabled && disabledReason && state.phase === "idle" && <p className="text-xs text-zinc-500">{disabledReason}</p>}
+      {disabled && disabledReason && state.phase === "idle" && <p className="text-xs leading-5 text-stone-500">{disabledReason}</p>}
       {state.phase !== "idle" && (
-        <div className={state.phase === "error" ? "rounded-md border border-rose-200 bg-rose-50 p-2 text-xs text-rose-700" : "rounded-md border border-blue-200 bg-blue-50 p-2 text-xs text-blue-700"}>
+        <div className={state.phase === "error" ? "rounded-md border border-rose-200 bg-rose-50 p-2 text-xs text-rose-700" : "rounded-md border border-teal-200 bg-teal-50 p-2 text-xs text-teal-800"}>
           <div className="flex items-center gap-2">
-            {state.phase === "running" && <span className="h-2 w-2 animate-pulse rounded-full bg-blue-600" />}
+            {state.phase === "running" && <span className="h-2 w-2 animate-pulse rounded-full bg-teal-700" />}
             <span>{state.stage}</span>
           </div>
           {state.error && <p className="mt-1 break-words">{state.error}</p>}

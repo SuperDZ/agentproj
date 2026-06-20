@@ -179,12 +179,28 @@ export function createMockHermesOutput(input: CreateResearchRunInput): HermesRes
 
 export async function createMockResearchRun(input: CreateResearchRunInput): Promise<HermesRunResult> {
   const parsedOutput = createMockHermesOutput(input);
+  const defaultSkills = [
+    { name: "competitive-research", callCount: 1, status: "used" as const, reason: "用于竞品检索与差异化分析。" },
+    { name: "document-analysis", callCount: 1, status: "used" as const, reason: "用于整理 PRD 和结构化输出。" }
+  ];
+  const defaultTools = [
+    { name: "web-research", callCount: 1, status: "used" as const, reason: "用于模拟外部资料检索。" }
+  ];
   return {
     hermesRunId: `mock_${Date.now()}`,
     mode: "mock",
     status: "completed",
     rawOutput: JSON.stringify(parsedOutput, null, 2),
-    parsedOutput
+    parsedOutput,
+    resourceUsage: {
+      mode: input.resourceMode === "auto" ? "auto" : "manual",
+      skills: input.resourceMode === "manual" && input.enabledSkills?.length
+        ? input.enabledSkills.map((item) => ({ ...item, callCount: 1, status: "used" as const, reason: "详细配置页启用，已传入 mock Hermes 调研。" }))
+        : defaultSkills,
+      tools: input.resourceMode === "manual" && input.enabledTools?.length
+        ? input.enabledTools.map((item) => ({ ...item, callCount: 1, status: "used" as const, reason: "详细配置页启用，已传入 mock Hermes 调研。" }))
+        : defaultTools
+    }
   };
 }
 

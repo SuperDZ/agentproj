@@ -14,6 +14,8 @@
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",
+    "ioredis": "^5.4.1",
+    "jszip": "^3.10.1",
     "lucide-react": "^0.468.0",
     "next": "^16.2.6",
     "pptxgenjs": "^4.0.1",

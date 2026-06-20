@@ -77,8 +77,23 @@ function buildLocalHermesPrompt(input: CreateResearchRunInput) {
     input.explanation ? `解释：${input.explanation}` : "",
     `行业：${input.industry}`,
     `目标用户：${input.targetUser}`,
-    `技术栈：${input.preferredTechStack || "未指定"}`
+    `技术栈：${input.preferredTechStack || "未指定"}`,
+    input.resourceMode === "auto" ? "Hermes 资源模式：自主决定本次调研使用哪些 Skills 和 Tools，不接收详细配置页启用项。" : "",
+    input.resourceMode === "manual" && input.enabledSkills?.length ? `详细配置启用 Skills：${input.enabledSkills.map((item) => item.name).join(", ")}` : "",
+    input.resourceMode === "manual" && input.enabledTools?.length ? `详细配置启用 Tools：${input.enabledTools.map((item) => item.name).join(", ")}` : ""
   ].filter(Boolean).join("\n");
+}
+
+function localResourceUsage(input: CreateResearchRunInput): HermesRunResult["resourceUsage"] {
+  return {
+    mode: input.resourceMode === "auto" ? "auto" : "manual",
+    skills: input.resourceMode === "manual"
+      ? (input.enabledSkills ?? []).map((item) => ({ ...item, callCount: 0, status: "not_reported" as const, reason: "已传给本地 Hermes CLI，CLI 未返回具体调用次数。" }))
+      : [{ name: "local-hermes-auto-skill-selection", callCount: 0, status: "not_reported", reason: "本地 Hermes 自主选择，CLI 未返回具体 Skill 列表。" }],
+    tools: input.resourceMode === "manual"
+      ? (input.enabledTools ?? []).map((item) => ({ ...item, callCount: 0, status: "not_reported" as const, reason: "已传给本地 Hermes CLI，CLI 未返回具体调用次数。" }))
+      : [{ name: "local-hermes-auto-tool-selection", callCount: 0, status: "not_reported", reason: "本地 Hermes 自主选择，CLI 未返回具体 Tool 列表。" }]
+  };
 }
 
 function buildLocalPlanningPrompt(input: CreatePlanningRunInput) {
@@ -95,7 +110,9 @@ function buildLocalPlanningPrompt(input: CreatePlanningRunInput) {
     `项目命题 idea：${input.idea}`,
     input.explanation ? `补充解释 explanation：${input.explanation}` : "补充解释 explanation：未填写",
     `行业 industry：${input.industry || "auto"}`,
-    `目标用户 targetUser：${input.targetUser || "auto"}`
+    `目标用户 targetUser：${input.targetUser || "auto"}`,
+    input.recommendedSkills?.length ? `项目级推荐 Skills：${input.recommendedSkills.map((item) => item.name).join(", ")}` : "",
+    input.recommendedTools?.length ? `项目级推荐 Tools：${input.recommendedTools.map((item) => item.name).join(", ")}` : ""
   ].join("\n");
 }
 
@@ -237,7 +254,8 @@ export async function createLocalResearchRun(input: CreateResearchRunInput): Pro
       mode: "local",
       status: "completed",
       rawOutput: json,
-      parsedOutput
+      parsedOutput,
+      resourceUsage: localResourceUsage(input)
     };
   } catch (error) {
     const parsedOutput = createMockHermesOutput(input);
@@ -245,14 +263,15 @@ export async function createLocalResearchRun(input: CreateResearchRunInput): Pro
     return {
       hermesRunId,
       mode: "local",
-      status: "completed",
+      status: "completed_with_fallback",
       rawOutput: JSON.stringify({
         localHermesFallback: true,
         reason: errorMessage,
         cliOutput: rawCliOutput,
         fallbackOutput: parsedOutput
       }, null, 2),
-      parsedOutput
+      parsedOutput,
+      resourceUsage: localResourceUsage(input)
     };
   }
 }

@@ -13,6 +13,7 @@ const originalEnv = { ...process.env };
 const modelConfigPath = path.join(process.cwd(), ".next", "hermes", "model-config.json");
 
 beforeEach(async () => {
+  vi.clearAllMocks();
   await fs.rm(modelConfigPath, { force: true });
 });
 
@@ -164,7 +165,7 @@ describe("Hermes local adapter", () => {
       targetUser: "PMs"
     });
 
-    expect(result.status).toBe("completed");
+    expect(result.status).toBe("completed_with_fallback");
     expect(result.rawOutput).toContain("localHermesFallback");
     expect(result.parsedOutput?.competitors.length).toBeGreaterThanOrEqual(7);
   });

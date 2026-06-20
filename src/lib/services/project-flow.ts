@@ -1,4 +1,5 @@
-import type { Prisma } from "@prisma/client";
+import type { AsyncTask, Prisma } from "@prisma/client";
+import JSZip from "jszip";
 import { evaluateProject, type EvaluationResult } from "@/lib/evaluation/engine";
 import {
   generateCodexPack,
@@ -12,9 +13,38 @@ import {
 } from "@/lib/export/codex-pack";
 import { hermesClient } from "@/lib/hermes/client";
 import { parseHermesResearchOutput } from "@/lib/hermes/parser";
-import type { HermesMode, HermesResearchOutput, HermesRunStatus } from "@/lib/hermes/types";
+import type { HermesMode, HermesResearchOutput, HermesRunResult, HermesRunStatus } from "@/lib/hermes/types";
 import { prisma } from "@/lib/db/prisma";
 import { generateJsonWithModel, type ModelConfig } from "@/lib/model/client";
+import { acquireIdempotencyKey, cacheDelete, waitForTaskNotification } from "@/lib/cache/redis";
+import {
+  asyncWorkerPollIntervalMs,
+  asyncTaskLeaseMs,
+  claimTask,
+  completeTask,
+  enqueueTask,
+  failTask,
+  findActiveTask,
+  heartbeat,
+  markTaskWaiting,
+  parseTaskPayload,
+  renewTaskLease,
+  researchTaskType
+} from "@/lib/async-tasks/store";
+import { logEvent, recordMetric, startSpan, finishSpan } from "@/lib/observability";
+import { deleteProjectStoredArtifactsByTypes, putArtifact } from "@/lib/artifacts/store";
+import {
+  generateProjectSkillToolRecommendations,
+  parseProjectSkillToolRecommendations,
+  projectSkillToolRecommendationsArtifact
+} from "@/lib/skills/project-recommendations";
+import {
+  hermesResearchResourceLogArtifact,
+  hermesResourceConfigArtifact,
+  parseHermesResourceConfig,
+  type HermesResearchResourceLog,
+  type HermesResourceUsageItem
+} from "@/lib/skills/resource-config";
 
 export const codexPackArtifactTypes = [
   "README.md",
@@ -74,9 +104,14 @@ type ResearchRunLike = {
 
 export type ResearchWorkerResult = {
   processed: boolean;
-  action: "idle" | "reset_stale" | "claimed" | "refreshed" | "failed";
+  action: "idle" | "reset_stale" | "claimed" | "refreshed" | "waited" | "succeeded" | "failed" | "dead";
   runId?: string;
+  taskId?: string;
   status?: string;
+};
+
+type ResearchTaskPayload = {
+  researchRunId: string;
 };
 
 function stringsFromUnknown(value: unknown): string[] {
@@ -192,6 +227,13 @@ function asStringArray(value: unknown): string[] {
   return [];
 }
 
+async function invalidateProjectCache(projectId: string) {
+  await Promise.all([
+    cacheDelete("projects:list"),
+    cacheDelete(`projects:detail:${projectId}`)
+  ]);
+}
+
 export function parseReportAssistantContext(project: ProjectArtifacts): ReportAssistantContext {
   const raw = parseJson<Record<string, unknown>>(getArtifactContent(project, "report_assistant_context"), {});
   return {
@@ -219,6 +261,33 @@ export function parseTechStackRecommendations(project: ProjectArtifacts): TechSt
       recommendation: recommendation === "high" || recommendation === "low" ? recommendation : "medium"
     };
   }).filter((item) => item.id && item.name);
+}
+
+export function getProjectSkillToolRecommendations(project: ProjectArtifacts) {
+  return parseProjectSkillToolRecommendations(getArtifactContent(project, projectSkillToolRecommendationsArtifact));
+}
+
+export async function createProjectSkillToolRecommendations(projectId: string) {
+  const project = await loadProjectFlowData(projectId);
+  const recommendations = await generateProjectSkillToolRecommendations({
+    idea: project.idea,
+    ideaExplanation: getArtifactContent(project, "idea_explanation"),
+    industry: project.industry,
+    targetUser: project.targetUser,
+    needFinancialSuitabilityCheck: project.needFinancialSuitabilityCheck,
+    needContinuousCompetitorMonitoring: project.needContinuousCompetitorMonitoring
+  });
+
+  await prisma.generatedArtifact.create({
+    data: {
+      projectId,
+      artifactType: projectSkillToolRecommendationsArtifact,
+      content: JSON.stringify(recommendations)
+    }
+  });
+  await invalidateProjectCache(projectId);
+
+  return recommendations;
 }
 
 export function buildDifferentiationBrief(research?: HermesResearchOutput) {
@@ -287,8 +356,26 @@ function buildResearchContext(project: ProjectWithFlowData) {
 
 function buildProjectResearchRequest(project: ProjectWithFlowData) {
   const researchContext = buildResearchContext(project);
+  const resourceConfig = parseHermesResourceConfig(getArtifactContent(project, hermesResourceConfigArtifact));
+  const enabledSkills = resourceConfig.mode === "manual"
+    ? resourceConfig.enabled
+      .filter((item) => item.kind === "skill")
+      .map((item) => ({ name: item.name, path: item.path, purpose: item.purpose, description: item.descriptionZh }))
+    : undefined;
+  const enabledTools = resourceConfig.mode === "manual"
+    ? resourceConfig.enabled
+      .filter((item) => item.kind === "tool")
+      .map((item) => ({ name: item.name, path: item.path, purpose: item.purpose, description: item.descriptionZh }))
+    : undefined;
+  const resourceBrief = resourceConfig.mode === "auto"
+    ? "Hermes 资源模式：让 Hermes 自主决定本次调研使用哪些 Skills 和 Tools；不要接收详细配置页的手动启用项。"
+    : [
+      "Hermes 资源模式：使用详细配置页已启用的 Skills 和 Tools。",
+      enabledSkills?.length ? `启用 Skills：${enabledSkills.map((item) => item.name).join("、")}` : "启用 Skills：无",
+      enabledTools?.length ? `启用 Tools：${enabledTools.map((item) => item.name).join("、")}` : "启用 Tools：无"
+    ].join("\n");
   return {
-    inputPrompt: `Research competitors and product differentiation for: ${project.idea}\nIndustry: ${researchContext.industry}\nTarget user: ${researchContext.targetUser}\nContext:\n${researchContext.explanation}`,
+    inputPrompt: `Research competitors and product differentiation for: ${project.idea}\nIndustry: ${researchContext.industry}\nTarget user: ${researchContext.targetUser}\nContext:\n${researchContext.explanation}\n\n${resourceBrief}`,
     input: {
       projectId: project.id,
       idea: project.idea,
@@ -296,7 +383,10 @@ function buildProjectResearchRequest(project: ProjectWithFlowData) {
       industry: researchContext.industry,
       targetUser: researchContext.targetUser,
       financialSuitability: researchContext.financialSuitability,
-      preferredTechStack: project.preferredTechStack || undefined
+      preferredTechStack: project.preferredTechStack || undefined,
+      resourceMode: resourceConfig.mode,
+      enabledSkills,
+      enabledTools
     }
   };
 }
@@ -351,7 +441,37 @@ export function evaluateProjectFlow(project: ProjectWithFlowData): { evaluation:
   return { evaluation, research, prd };
 }
 
-export async function persistResearchResult(projectId: string, runDbId: string, result: { hermesRunId: string; mode: HermesMode; status: HermesRunStatus; rawOutput: string; parsedOutput?: HermesResearchOutput }) {
+function usageItems(
+  items: Array<{ name: string; path?: string; purpose?: string[]; callCount?: number; status?: "used" | "planned" | "not_reported"; reason?: string }> | undefined,
+  kind: "skill" | "tool",
+  fallbackReason: string
+): HermesResourceUsageItem[] {
+  return (items ?? []).map((item) => ({
+    kind,
+    name: item.name,
+    path: item.path,
+    purpose: item.purpose,
+    callCount: Number.isFinite(Number(item.callCount)) ? Math.max(0, Number(item.callCount)) : 0,
+    status: item.status === "used" || item.status === "planned" || item.status === "not_reported" ? item.status : "not_reported",
+    reason: item.reason || fallbackReason
+  }));
+}
+
+function buildResourceLog(projectId: string, runDbId: string, result: HermesRunResult): HermesResearchResourceLog | undefined {
+  if (!result.resourceUsage) return undefined;
+  return {
+    projectId,
+    researchRunId: runDbId,
+    hermesRunId: result.hermesRunId,
+    mode: result.resourceUsage.mode,
+    generatedAt: new Date().toISOString(),
+    skills: usageItems(result.resourceUsage.skills, "skill", result.resourceUsage.mode === "auto" ? "Hermes 自主选择或未报告调用次数。" : "来自详细配置页启用项。"),
+    tools: usageItems(result.resourceUsage.tools, "tool", result.resourceUsage.mode === "auto" ? "Hermes 自主选择或未报告调用次数。" : "来自详细配置页启用项。"),
+    raw: result.resourceUsage.raw
+  };
+}
+
+export async function persistResearchResult(projectId: string, runDbId: string, result: HermesRunResult) {
   const runData: Prisma.ResearchRunUpdateInput = {
     hermesRunId: result.hermesRunId,
     mode: result.mode,
@@ -359,7 +479,7 @@ export async function persistResearchResult(projectId: string, runDbId: string, 
     rawOutput: result.rawOutput
   };
   if (result.parsedOutput) runData.parsedOutputJson = JSON.stringify(result.parsedOutput);
-  if (["completed", "failed", "completed_without_output"].includes(result.status)) runData.completedAt = new Date();
+  if (["completed", "failed", "completed_without_output", "completed_with_fallback"].includes(result.status)) runData.completedAt = new Date();
 
   const mutations: Prisma.PrismaPromise<unknown>[] = [
     prisma.researchRun.update({
@@ -391,7 +511,21 @@ export async function persistResearchResult(projectId: string, runDbId: string, 
     );
   }
 
+  const resourceLog = ["completed", "failed", "completed_without_output", "completed_with_fallback"].includes(result.status)
+    ? buildResourceLog(projectId, runDbId, result)
+    : undefined;
+  if (resourceLog) {
+    mutations.push(prisma.generatedArtifact.create({
+      data: {
+        projectId,
+        artifactType: hermesResearchResourceLogArtifact,
+        content: JSON.stringify(resourceLog)
+      }
+    }));
+  }
+
   await prisma.$transaction(mutations);
+  await invalidateProjectCache(projectId);
 }
 
 export async function saveReportAssistantContext(projectId: string, context: ReportAssistantContext & { pmPlanningAdvice?: string }) {
@@ -413,6 +547,7 @@ export async function saveReportAssistantContext(projectId: string, context: Rep
   }
 
   await prisma.$transaction(writes);
+  await invalidateProjectCache(projectId);
 }
 
 export async function generateInitialProjectPlanning(projectId: string) {
@@ -444,6 +579,9 @@ export async function generateInitialProjectPlanning(projectId: string) {
 
 export async function generateInitialProjectPlanningWithHermes(projectId: string) {
   const project = await loadProjectFlowData(projectId);
+  const recommended = getProjectSkillToolRecommendations(project);
+  const recommendedSkills = recommended.filter((item) => item.kind !== "tool").map((item) => ({ name: item.name, purpose: item.purpose }));
+  const recommendedTools = recommended.filter((item) => item.kind === "tool").map((item) => ({ name: item.name, purpose: item.purpose }));
   const fallback = {
     pmPlanningAdvice: [
       `项目命题：${project.idea}`,
@@ -459,7 +597,9 @@ export async function generateInitialProjectPlanningWithHermes(projectId: string
     idea: project.idea,
     explanation: getArtifactContent(project, "idea_explanation"),
     industry: project.industry,
-    targetUser: project.targetUser
+    targetUser: project.targetUser,
+    recommendedSkills,
+    recommendedTools
   }), fallback);
 
   await prisma.$transaction([
@@ -476,6 +616,7 @@ export async function generateInitialProjectPlanningWithHermes(projectId: string
     }),
     prisma.generatedArtifact.create({ data: { projectId, artifactType: "pm_planning_advice", content: generated.pmPlanningAdvice } })
   ]);
+  await invalidateProjectCache(projectId);
   return generated;
 }
 
@@ -524,6 +665,7 @@ export async function generateTechStackRecommendations(projectId: string) {
     components: asStringArray((item as Record<string, unknown>).components)
   })) as TechStackRecommendation[];
   await prisma.generatedArtifact.create({ data: { projectId, artifactType: "tech_stack_recommendations", content: JSON.stringify(recommendations) } });
+  await invalidateProjectCache(projectId);
   return recommendations;
 }
 
@@ -536,19 +678,52 @@ export async function selectProjectTechStack(projectId: string, stackId: string)
     prisma.project.update({ where: { id: projectId }, data: { preferredTechStack: value } }),
     prisma.generatedArtifact.create({ data: { projectId, artifactType: "selected_tech_stack", content: JSON.stringify(selected) } })
   ]);
+  await invalidateProjectCache(projectId);
   return selected;
 }
 
 export async function refreshLatestResearchRun(projectId: string) {
   const project = await loadProjectFlowData(projectId);
   const latestRun = project.researchRuns[0];
-  if (!latestRun?.hermesRunId || latestRun.parsedOutputJson || ["failed", "completed_without_output"].includes(latestRun.status)) return latestRun;
+  if (!latestRun) return latestRun;
+  if (latestRun.parsedOutputJson || ["failed", "completed", "completed_without_output", "completed_with_fallback"].includes(latestRun.status)) return latestRun;
+  if (!latestRun.hermesRunId) return latestRun;
 
   return refreshResearchRun(latestRun);
 }
 
 export async function runProjectResearch(projectId: string) {
-  return startProjectResearch(projectId);
+  const acquired = await acquireIdempotencyKey(`research:start:${projectId}`, 10);
+  if (!acquired) {
+    const activeRun = await waitForActiveResearchRun(projectId);
+    if (activeRun) return activeRun;
+  }
+
+  const run = await startProjectResearch(projectId);
+  const existingTask = await findActiveTask(projectId, researchTaskType);
+  const task = existingTask ?? await enqueueTask({
+    type: researchTaskType,
+    projectId,
+    payload: { researchRunId: run.id } satisfies ResearchTaskPayload,
+    priority: 10,
+    maxAttempts: 3
+  });
+
+  if (acquired) await processResearchTaskById(task.id);
+  await invalidateProjectCache(projectId);
+  return prisma.researchRun.findUnique({ where: { id: run.id } });
+}
+
+async function waitForActiveResearchRun(projectId: string) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const run = await prisma.researchRun.findFirst({
+      where: { projectId, status: { in: ["queued", "running"] } },
+      orderBy: { createdAt: "desc" }
+    });
+    if (run) return run;
+    await new Promise((resolve) => setTimeout(resolve, 75));
+  }
+  return null;
 }
 
 export async function startProjectResearch(projectId: string) {
@@ -566,6 +741,7 @@ export async function startProjectResearch(projectId: string) {
     }
   });
 
+  await invalidateProjectCache(projectId);
   return dbRun;
 }
 
@@ -582,8 +758,7 @@ function staleResearchRunThresholdMs() {
 }
 
 export function researchWorkerPollIntervalMs() {
-  const value = Number(process.env.HERMES_RESEARCH_WORKER_POLL_MS ?? 5000);
-  return Number.isFinite(value) && value > 0 ? value : 5000;
+  return asyncWorkerPollIntervalMs();
 }
 
 export async function resetStaleResearchRuns(now = new Date()) {
@@ -601,29 +776,37 @@ export async function resetStaleResearchRuns(now = new Date()) {
   });
 }
 
-async function claimNextQueuedResearchRun(): Promise<ResearchRunLike | null> {
-  const next = await prisma.researchRun.findFirst({
-    where: { status: "queued" },
-    orderBy: { createdAt: "asc" }
-  });
-  if (!next) return null;
-
-  const claimed = await prisma.researchRun.updateMany({
-    where: { id: next.id, status: "queued" },
-    data: { status: "running" }
-  });
-  if (claimed.count === 0) return claimNextQueuedResearchRun();
-
-  return prisma.researchRun.findUniqueOrThrow({ where: { id: next.id } });
-}
-
 export async function refreshResearchRun(run: ResearchRunLike) {
-  if (!run.hermesRunId || run.parsedOutputJson || ["failed", "completed", "completed_without_output"].includes(run.status)) {
+  if (!run.hermesRunId || run.parsedOutputJson || ["failed", "completed", "completed_without_output", "completed_with_fallback"].includes(run.status)) {
     return prisma.researchRun.findUnique({ where: { id: run.id } });
   }
 
   const result = coerceWorkerResult(await hermesClient.getRunResult(run.hermesRunId));
   await persistResearchResult(run.projectId, run.id, result);
+  return prisma.researchRun.findUnique({ where: { id: run.id } });
+}
+
+async function advanceResearchRun(run: ResearchRunLike) {
+  if (run.parsedOutputJson || ["failed", "completed", "completed_without_output", "completed_with_fallback"].includes(run.status)) {
+    return prisma.researchRun.findUnique({ where: { id: run.id } });
+  }
+
+  const originalStatus = run.status;
+  let claimedRun = run;
+  if (run.status === "queued") {
+    const claimed = await prisma.researchRun.updateMany({
+      where: { id: run.id, status: "queued" },
+      data: { status: "running" }
+    });
+    if (claimed.count === 0) return prisma.researchRun.findUnique({ where: { id: run.id } });
+    claimedRun = await prisma.researchRun.findUniqueOrThrow({ where: { id: run.id } });
+  }
+
+  if (!claimedRun.hermesRunId && claimedRun.status === "running" && originalStatus !== "queued") {
+    return prisma.researchRun.findUnique({ where: { id: run.id } });
+  }
+
+  await processClaimedResearchRun(claimedRun);
   return prisma.researchRun.findUnique({ where: { id: run.id } });
 }
 
@@ -653,23 +836,151 @@ async function processClaimedResearchRun(run: ResearchRunLike): Promise<Research
   }
 }
 
-export async function processResearchWorkerOnce(): Promise<ResearchWorkerResult> {
-  const reset = await resetStaleResearchRuns();
-  if (reset.count > 0) return { processed: true, action: "reset_stale", status: "queued" };
+async function processResearchTaskById(taskId: string): Promise<ResearchWorkerResult> {
+  const task = await claimTask(taskId);
+  if (!task) return { processed: false, action: "idle" };
+  return processAsyncTask(task);
+}
 
-  const runningExternalRun = await prisma.researchRun.findFirst({
+async function processAsyncTask(task: AsyncTask): Promise<ResearchWorkerResult> {
+  if (task.type !== researchTaskType) {
+    await failTask(task, new Error(`Unsupported async task type: ${task.type}`));
+    return { processed: true, action: "failed", taskId: task.id, status: "failed" };
+  }
+
+  const payload = parseTaskPayload<ResearchTaskPayload>(task, { researchRunId: "" });
+  const run = payload.researchRunId
+    ? await prisma.researchRun.findUnique({ where: { id: payload.researchRunId } })
+    : null;
+  if (!run) {
+    await failTask(task, new Error("ResearchRun not found for async task."));
+    return { processed: true, action: "failed", taskId: task.id, status: "failed" };
+  }
+
+  const span = await startSpan({
+    name: "research.run",
+    projectId: run.projectId,
+    taskId: task.id,
+    attributes: { researchRunId: run.id, status: run.status, hermesRunId: run.hermesRunId }
+  });
+
+  const stopLeaseRenewal = startTaskLeaseRenewal(task);
+  try {
+    const advanced = await advanceResearchRun(run);
+    const status = advanced?.status ?? run.status;
+    const terminalSuccess = advanced?.parsedOutputJson || status === "completed_with_fallback";
+    const terminalFailure = status === "failed" || status === "completed_without_output";
+
+    if (terminalSuccess) {
+      const completed = await completeTask(task, { researchRunId: run.id, status });
+      if (completed.status !== "succeeded") {
+        await finishSpan(span, { status: "cancelled", attributes: { status, taskStatus: completed.status } });
+        return { processed: false, action: "idle", taskId: task.id, runId: run.id, status: completed.status };
+      }
+      await finishSpan(span, { status: "ok", attributes: { status, taskStatus: completed.status } });
+      return { processed: true, action: "succeeded", taskId: task.id, runId: run.id, status };
+    }
+
+    if (terminalFailure) {
+      const failed = await failTask(task, new Error(advanced?.rawOutput || `Research run ended with ${status}.`));
+      if (failed.status !== "waiting" && failed.status !== "dead") {
+        await finishSpan(span, { status: "cancelled", attributes: { status, taskStatus: failed.status } });
+        return { processed: false, action: "idle", taskId: task.id, runId: run.id, status: failed.status };
+      }
+      if (failed.status === "waiting") {
+        await prisma.researchRun.update({
+          where: { id: run.id },
+          data: {
+            status: "queued",
+            hermesRunId: null,
+            completedAt: null
+          }
+        });
+      }
+      await finishSpan(span, { status: "error", attributes: { status, taskStatus: failed.status } });
+      return { processed: true, action: failed.status === "dead" ? "dead" : "failed", taskId: task.id, runId: run.id, status: failed.status };
+    }
+
+    const waited = await markTaskWaiting(task, {
+      runAfter: new Date(Date.now() + researchWorkerPollIntervalMs()),
+      result: { researchRunId: run.id, status },
+      message: `Research run ${run.id} is still ${status}.`
+    });
+    if (waited.status !== "waiting") {
+      await finishSpan(span, { status: "cancelled", attributes: { status, taskStatus: waited.status } });
+      return { processed: false, action: "idle", taskId: task.id, runId: run.id, status: waited.status };
+    }
+    await finishSpan(span, { status: "ok", attributes: { status, taskStatus: waited.status } });
+    return { processed: true, action: "waited", taskId: task.id, runId: run.id, status };
+  } catch (error) {
+    const failed = await failTask(task, error);
+    await finishSpan(span, { status: "error", attributes: { error: error instanceof Error ? error.message : String(error), taskStatus: failed.status } });
+    if (failed.status !== "waiting" && failed.status !== "dead") {
+      return { processed: false, action: "idle", taskId: task.id, runId: run.id, status: failed.status };
+    }
+    if (failed.status === "waiting") {
+      await prisma.researchRun.update({
+        where: { id: run.id },
+        data: {
+          status: "queued",
+          hermesRunId: null,
+          completedAt: null,
+          rawOutput: error instanceof Error ? error.message : String(error)
+        }
+      });
+    }
+    return { processed: true, action: failed.status === "dead" ? "dead" : "failed", taskId: task.id, runId: run.id, status: failed.status };
+  } finally {
+    stopLeaseRenewal();
+  }
+}
+
+function startTaskLeaseRenewal(task: AsyncTask) {
+  const intervalMs = Math.max(1000, Math.min(Math.floor(asyncTaskLeaseMs() / 2), 30_000));
+  const timer = setInterval(() => {
+    void renewTaskLease(task);
+  }, intervalMs);
+  return () => clearInterval(timer);
+}
+
+async function enqueueLegacyResearchTaskIfNeeded() {
+  const run = await prisma.researchRun.findFirst({
     where: {
-      status: "running",
-      hermesRunId: { not: null },
-      parsedOutputJson: null
+      OR: [
+        { status: "queued" },
+        { status: "running", hermesRunId: { not: null }, parsedOutputJson: null }
+      ]
     },
     orderBy: { createdAt: "asc" }
   });
-  if (runningExternalRun) return processClaimedResearchRun(runningExternalRun);
+  if (!run) return null;
+  const existing = await findActiveTask(run.projectId, researchTaskType);
+  if (existing) return existing;
+  return enqueueTask({
+    type: researchTaskType,
+    projectId: run.projectId,
+    payload: { researchRunId: run.id } satisfies ResearchTaskPayload,
+    priority: 0,
+    maxAttempts: 3
+  });
+}
 
-  const claimed = await claimNextQueuedResearchRun();
-  if (!claimed) return { processed: false, action: "idle" };
-  return processClaimedResearchRun(claimed);
+export async function processResearchWorkerOnce(): Promise<ResearchWorkerResult> {
+  await heartbeat("running", { kind: "research-worker" }).catch(() => undefined);
+  const reset = await resetStaleResearchRuns();
+  if (reset.count > 0) {
+    await logEvent({ source: "research-worker", eventType: "research.reset_stale", message: "Recovered stale research runs.", metadata: { count: reset.count } });
+    await recordMetric({ name: "research.reset_stale", value: reset.count, unit: "count" });
+    return { processed: true, action: "reset_stale", status: "queued" };
+  }
+
+  let task = await claimTask();
+  if (!task) {
+    const legacyTask = await enqueueLegacyResearchTaskIfNeeded();
+    task = legacyTask ? await claimTask(legacyTask.id) : null;
+  }
+  if (!task) return { processed: false, action: "idle" };
+  return processAsyncTask(task);
 }
 
 export async function runResearchWorkerLoop() {
@@ -681,19 +992,40 @@ export async function runResearchWorkerLoop() {
   while (!stopping) {
     const result = await processResearchWorkerOnce();
     if (!result.processed) {
-      await new Promise((resolve) => setTimeout(resolve, researchWorkerPollIntervalMs()));
+      await waitForTaskNotification(researchWorkerPollIntervalMs());
     }
   }
+  await heartbeat("stopped", { kind: "research-worker" }).catch(() => undefined);
 }
 
 export async function generateProjectPrd(projectId: string) {
   const project = await loadProjectFlowData(projectId);
   const content = generatePrdMarkdown(toPackProject(project), getLatestResearch(project));
-  return prisma.generatedArtifact.create({ data: { projectId, artifactType: "prd", content } });
+  const artifact = await prisma.generatedArtifact.create({ data: { projectId, artifactType: "prd", content } });
+  await putArtifact({
+    projectId,
+    generatedArtifactId: artifact.id,
+    artifactType: "prd",
+    filename: "PRD.md",
+    content,
+    mimeType: "text/markdown;charset=utf-8"
+  });
+  await invalidateProjectCache(projectId);
+  return artifact;
 }
 
 export async function saveProjectPrd(projectId: string, content: string) {
-  return prisma.generatedArtifact.create({ data: { projectId, artifactType: "prd", content } });
+  const artifact = await prisma.generatedArtifact.create({ data: { projectId, artifactType: "prd", content } });
+  await putArtifact({
+    projectId,
+    generatedArtifactId: artifact.id,
+    artifactType: "prd",
+    filename: "PRD.md",
+    content,
+    mimeType: "text/markdown;charset=utf-8"
+  });
+  await invalidateProjectCache(projectId);
+  return artifact;
 }
 
 function competitorMatrixForEvaluation(project: ProjectWithFlowData) {
@@ -757,6 +1089,7 @@ export async function evaluateProjectById(projectId: string): Promise<Evaluation
     previousHermesResearch: research
   });
   await persistEvaluation(projectId, hermesEvaluation);
+  await invalidateProjectCache(projectId);
   return hermesEvaluation;
 }
 
@@ -774,10 +1107,31 @@ export async function exportProjectCodexPack(projectId: string): Promise<CodexPa
     codexPackText: packToClipboardText(draftFiles)
   });
   const files = generateCodexPack(toPackProject(project), research, finalEvaluation, prd);
-  await prisma.$transaction([
-    prisma.generatedArtifact.deleteMany({ where: { projectId, artifactType: { in: codexPackArtifactTypes } } }),
-    ...files.map((file) => prisma.generatedArtifact.create({ data: { projectId, artifactType: file.filename, content: file.content } }))
-  ]);
+  const artifactTypes = [...new Set([...files.map((file) => file.filename), "codex-pack.zip"])];
+  await deleteProjectStoredArtifactsByTypes(projectId, artifactTypes);
+  await prisma.generatedArtifact.deleteMany({ where: { projectId, artifactType: { in: artifactTypes } } });
+  const artifacts = await prisma.$transaction(
+    files.map((file) => prisma.generatedArtifact.create({ data: { projectId, artifactType: file.filename, content: file.content } }))
+  );
+  await Promise.all(files.map((file, index) => putArtifact({
+    projectId,
+    generatedArtifactId: artifacts[index]?.id,
+    artifactType: file.filename,
+    filename: file.filename,
+    content: file.content
+  })));
+  const zip = new JSZip();
+  files.forEach((file) => zip.file(file.filename, file.content));
+  const zipBuffer = Buffer.from(await zip.generateAsync({ type: "nodebuffer" }));
+  await putArtifact({
+    projectId,
+    artifactType: "codex-pack.zip",
+    filename: "codex-pack.zip",
+    content: zipBuffer,
+    mimeType: "application/zip",
+    forceFile: true
+  });
+  await invalidateProjectCache(projectId);
   return files;
 }
 
@@ -806,7 +1160,16 @@ export async function generateProjectPrototypePrompt(projectId: string) {
     "需要避免：",
     research?.differentiation.should_not_build_features.map((item) => `- ${item}`).join("\n") || "- 不要加入与核心场景无关的通用功能。"
   ].join("\n");
-  await prisma.generatedArtifact.create({ data: { projectId, artifactType: "prototype_design_prompt", content: prompt } });
+  const artifact = await prisma.generatedArtifact.create({ data: { projectId, artifactType: "prototype_design_prompt", content: prompt } });
+  await putArtifact({
+    projectId,
+    generatedArtifactId: artifact.id,
+    artifactType: "prototype_design_prompt",
+    filename: "prototype-design-prompt.txt",
+    content: prompt,
+    mimeType: "text/plain;charset=utf-8"
+  });
+  await invalidateProjectCache(projectId);
   return prompt;
 }
 
@@ -848,8 +1211,92 @@ export async function generateProjectReportDeckPackage(projectId: string): Promi
     fallback
   });
   const reportPackage = normalizeReportDeckPackage(generated, fallback);
-  await prisma.generatedArtifact.create({ data: { projectId, artifactType: "hermes_ppt_task", content: JSON.stringify(reportPackage) } });
+  const artifact = await prisma.generatedArtifact.create({ data: { projectId, artifactType: "hermes_ppt_task", content: JSON.stringify(reportPackage) } });
+  await storeReportDeckArtifacts(projectId, reportPackage, artifact.id);
+  await invalidateProjectCache(projectId);
   return reportPackage;
+}
+
+async function storeReportDeckArtifacts(projectId: string, reportPackage: ReportDeckPackage, generatedArtifactId: string) {
+  const baseName = safeArtifactFilename(reportPackage.deckTitle || "report-deck");
+  const packageJson = JSON.stringify(reportPackage, null, 2);
+  await putArtifact({
+    projectId,
+    generatedArtifactId,
+    artifactType: "hermes_ppt_task",
+    filename: `${baseName}-package.json`,
+    content: packageJson,
+    mimeType: "application/json;charset=utf-8"
+  });
+  await putArtifact({
+    projectId,
+    artifactType: "hermes_ppt_prompt",
+    filename: `${baseName}-Hermes-PPT-prompt.txt`,
+    content: reportPackage.prompt,
+    mimeType: "text/plain;charset=utf-8"
+  });
+  await putArtifact({
+    projectId,
+    artifactType: "report_manuscript",
+    filename: `${baseName}-manuscript.doc`,
+    content: reportDeckWordHtml(reportPackage),
+    mimeType: "text/html;charset=utf-8"
+  });
+  await putArtifact({
+    projectId,
+    artifactType: "report_deck_pptx",
+    filename: `${baseName}.pptx`,
+    content: await createReportDeckPptxBuffer(reportPackage),
+    mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    forceFile: true
+  });
+}
+
+async function createReportDeckPptxBuffer(reportPackage: ReportDeckPackage) {
+  const pptxgen = (await import("pptxgenjs")).default;
+  const pptx = new pptxgen();
+  pptx.layout = "LAYOUT_WIDE";
+  pptx.author = "SpecFlow Agent / Hermes";
+  pptx.subject = "Hermes presentation task output";
+  pptx.title = reportPackage.deckTitle;
+  pptx.company = "SpecFlow";
+
+  const cover = pptx.addSlide();
+  cover.background = { color: "F8FAFC" };
+  cover.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 13.33, h: 1.0, fill: { color: "111827" }, line: { color: "111827" } });
+  cover.addText("Hermes 汇报材料", { x: 0.65, y: 0.3, w: 3.2, h: 0.24, fontSize: 12, bold: true, color: "FBBF24", margin: 0 });
+  cover.addText(reportPackage.deckTitle, { x: 0.75, y: 1.8, w: 8.8, h: 0.9, fontSize: 28, bold: true, color: "18181B", fit: "shrink" });
+  cover.addText(new Date().toLocaleDateString("zh-CN"), { x: 10.2, y: 6.75, w: 2.2, h: 0.22, fontSize: 9, color: "71717A", align: "right", margin: 0 });
+
+  reportPackage.slides.slice(0, 12).forEach((slideData) => {
+    const slide = pptx.addSlide();
+    slide.background = { color: "F8FAFC" };
+    slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 13.33, h: 0.72, fill: { color: "172554" }, line: { color: "172554" } });
+    slide.addText(slideData.title, { x: 0.6, y: 0.23, w: 9.0, h: 0.24, fontSize: 17, bold: true, color: "FFFFFF", margin: 0 });
+    slideData.bullets.slice(0, 6).forEach((item, index) => {
+      slide.addText(`${index + 1}`, { x: 0.75, y: 1.3 + index * 0.72, w: 0.3, h: 0.24, fontSize: 10, bold: true, color: "B45309", margin: 0 });
+      slide.addText(item, { x: 1.18, y: 1.25 + index * 0.72, w: 10.8, h: 0.34, fontSize: 14, color: "18181B", fit: "shrink", margin: 0.02 });
+    });
+    if (slideData.speakerNotes) slide.addNotes(slideData.speakerNotes);
+  });
+
+  const output = await (pptx as unknown as { write: (options: { outputType: "nodebuffer" }) => Promise<Buffer | Uint8Array> }).write({ outputType: "nodebuffer" });
+  return Buffer.from(output);
+}
+
+function reportDeckWordHtml(reportPackage: ReportDeckPackage) {
+  const slides = reportPackage.slides
+    .map((slide, index) => `<h2>第 ${index + 1} 页：${escapeHtml(slide.title)}</h2><p>${escapeHtml(slide.speakerNotes)}</p><ul>${slide.bullets.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`)
+    .join("");
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(reportPackage.deckTitle)} 讲稿</title></head><body><h1>${escapeHtml(reportPackage.deckTitle)} 讲稿</h1><pre>${escapeHtml(reportPackage.manuscript)}</pre>${slides}</body></html>`;
+}
+
+function safeArtifactFilename(value: string) {
+  return value.replace(/[\\/:*?"<>|]+/g, "-").replace(/\s+/g, "-").slice(0, 80) || "artifact";
+}
+
+function escapeHtml(value: string) {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
 
 function scheduleFromOptions(project: { needContinuousCompetitorMonitoring: boolean }, options?: MonitorJobOptions) {
