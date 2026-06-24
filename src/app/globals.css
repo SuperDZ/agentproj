@@ -4,13 +4,13 @@
 
 :root {
   color-scheme: light;
-  --surface: #f5f2eb;
-  --surface-strong: #fffdf8;
+  --surface: #f4f7fb;
+  --surface-strong: #ffffff;
   --ink: #161615;
-  --muted: #6b665f;
-  --line: #ded7cb;
-  --accent: #0f766e;
-  --accent-strong: #115e59;
+  --muted: #5f6673;
+  --line: #d9e1ec;
+  --accent: #2563eb;
+  --accent-strong: #1d4ed8;
   --amber: #b45309;
   --rose: #be123c;
   --shadow: 0 18px 45px rgba(38, 31, 20, 0.09);
@@ -31,8 +31,9 @@ html {
 body {
   margin: 0;
   background:
-    radial-gradient(circle at 18% 0%, rgba(15, 118, 110, 0.14), transparent 30rem),
-    linear-gradient(135deg, rgba(255, 253, 248, 0.94), rgba(245, 242, 235, 0.96));
+    radial-gradient(circle at 18% 0%, rgba(37, 99, 235, 0.14), transparent 30rem),
+    radial-gradient(circle at 90% 12%, rgba(20, 184, 166, 0.1), transparent 24rem),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.96), rgba(244, 247, 251, 0.98));
   color: var(--ink);
   font-feature-settings: "kern";
   text-rendering: optimizeLegibility;
@@ -47,8 +48,8 @@ body::before {
   pointer-events: none;
   opacity: 0.45;
   background-image:
-    linear-gradient(rgba(22, 22, 21, 0.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(22, 22, 21, 0.035) 1px, transparent 1px);
+    linear-gradient(rgba(37, 99, 235, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(37, 99, 235, 0.035) 1px, transparent 1px);
   background-size: 44px 44px;
   mask-image: linear-gradient(to bottom, black, transparent 78%);
 }

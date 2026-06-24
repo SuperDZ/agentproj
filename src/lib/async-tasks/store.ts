@@ -57,6 +57,7 @@ export function parseTaskPayload<T>(task: Pick<AsyncTask, "payloadJson">, fallba
 }
 
 export async function enqueueTask(input: {
+  id?: string;
   type: string;
   projectId?: string;
   payload: unknown;
@@ -65,6 +66,7 @@ export async function enqueueTask(input: {
 }) {
   const task = await prisma.asyncTask.create({
     data: {
+      id: input.id,
       type: input.type,
       projectId: input.projectId,
       payloadJson: taskPayload(input.payload),
@@ -182,6 +184,18 @@ export async function renewTaskLease(task: AsyncTask) {
     data: { lockExpiresAt }
   });
   return renewed.count === 1;
+}
+
+export async function ownsTaskLease(taskId: string) {
+  const task = await prisma.asyncTask.findFirst({
+    where: {
+      id: taskId,
+      status: "running",
+      lockedBy: workerId(),
+      lockExpiresAt: { gt: new Date() }
+    }
+  });
+  return Boolean(task);
 }
 
 export async function markTaskWaiting(task: AsyncTask, input: { runAfter?: Date; result?: unknown; message?: string }) {

@@ -12,6 +12,7 @@ type WorkflowActionButtonProps = {
   disabled?: boolean;
   disabledReason?: string;
   background?: boolean;
+  body?: unknown;
 };
 
 type ActionState = {
@@ -29,7 +30,7 @@ const fallbackText = {
   submitted: "已提交后台运行"
 };
 
-export function WorkflowActionButton({ label, endpoint, stages, className, pollEndpoint, disabled, disabledReason, background }: WorkflowActionButtonProps) {
+export function WorkflowActionButton({ label, endpoint, stages, className, pollEndpoint, disabled, disabledReason, background, body }: WorkflowActionButtonProps) {
   const router = useRouter();
   const [, startTransition] = useTransition();
   const [state, setState] = useState<ActionState>({ phase: "idle", stage: "" });
@@ -65,7 +66,11 @@ export function WorkflowActionButton({ label, endpoint, stages, className, pollE
         });
       }, 2400);
 
-      const response = await fetch(endpoint, { method: "POST" });
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: body === undefined ? undefined : { "content-type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error || payload.message || fallbackText.failedDetail);
 

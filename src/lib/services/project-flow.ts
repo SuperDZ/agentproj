@@ -33,6 +33,7 @@ import {
 } from "@/lib/async-tasks/store";
 import { logEvent, recordMetric, startSpan, finishSpan } from "@/lib/observability";
 import { deleteProjectStoredArtifactsByTypes, putArtifact } from "@/lib/artifacts/store";
+import { isAgentReviewTask, latestBlockingReview, processAgentReviewTask } from "@/lib/agents/service";
 import {
   generateProjectSkillToolRecommendations,
   parseProjectSkillToolRecommendations,
@@ -843,6 +844,10 @@ async function processResearchTaskById(taskId: string): Promise<ResearchWorkerRe
 }
 
 async function processAsyncTask(task: AsyncTask): Promise<ResearchWorkerResult> {
+  if (isAgentReviewTask(task.type)) {
+    return processAgentReviewTask(task);
+  }
+
   if (task.type !== researchTaskType) {
     await failTask(task, new Error(`Unsupported async task type: ${task.type}`));
     return { processed: true, action: "failed", taskId: task.id, status: "failed" };
@@ -1094,6 +1099,11 @@ export async function evaluateProjectById(projectId: string): Promise<Evaluation
 }
 
 export async function exportProjectCodexPack(projectId: string): Promise<CodexPackFile[]> {
+  const blockingReview = await latestBlockingReview(projectId, ["research", "prd", "codex_pack"]);
+  if (blockingReview) {
+    throw new Error(`Codex Pack export is blocked by agent review ${blockingReview.id}.`);
+  }
+
   const project = await loadProjectFlowData(projectId);
   const { evaluation, research, prd } = evaluateProjectFlow(project);
   const draftFiles = generateCodexPack(toPackProject(project), research, evaluation, prd);

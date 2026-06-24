@@ -38,12 +38,12 @@ export function Progress({ value }: { value: number }) {
 
 export const buttonStyles = {
   primary:
-    "inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-4 text-sm font-semibold text-white transition hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300",
+    "inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-brand-500 px-4 text-sm font-semibold text-white shadow-sm shadow-blue-900/15 transition duration-200 hover:-translate-y-0.5 hover:bg-brand-700 hover:shadow-md hover:shadow-blue-900/20 active:translate-y-0 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none",
   secondary:
-    "inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-stone-300 bg-white/80 px-4 text-sm font-semibold text-stone-900 shadow-sm transition hover:border-teal-300 hover:bg-teal-50",
+    "inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-stone-300 bg-white/85 px-4 text-sm font-semibold text-stone-900 shadow-sm transition duration-200 hover:border-brand-500/40 hover:bg-brand-50",
   danger:
     "inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-rose-200 bg-white px-3 text-sm font-semibold text-rose-700 transition hover:bg-rose-50 disabled:cursor-wait disabled:opacity-60"
 };
 
 export const fieldStyles =
-  "w-full rounded-lg border border-stone-300 bg-white/90 px-3 text-sm text-stone-950 outline-none transition placeholder:text-stone-400 focus:border-teal-600 focus:ring-4 focus:ring-teal-100";
+  "w-full rounded-lg border border-stone-300 bg-white/95 px-3 text-sm text-stone-950 outline-none shadow-inner shadow-stone-950/[0.02] transition duration-200 placeholder:text-stone-600 hover:border-stone-400 focus:border-brand-500 focus:ring-2 focus:ring-brand-500/25";
