@@ -399,8 +399,28 @@ export async function removeSkillWhitelist(name: string) {
   return { removed: entries.length - next.length };
 }
 
+function canonicalGithubRepo(input: Pick<SkillWhitelistEntry, "name" | "url" | "cloneUrl">) {
+  return githubRepoFromUrl(input.url) || githubRepoFromUrl(input.cloneUrl) || githubRepoFromIdentifier(input.name);
+}
+
+function normalizeUrl(value?: string) {
+  return value?.trim().replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
+}
+
 export function sameWhitelistEntry(left: SkillWhitelistEntry, right: Pick<SkillWhitelistEntry, "name" | "url" | "cloneUrl">) {
-  return left.name === right.name || (!!left.url && left.url === right.url) || (!!left.cloneUrl && left.cloneUrl === right.cloneUrl);
+  const leftRepo = canonicalGithubRepo(left);
+  const rightRepo = canonicalGithubRepo(right);
+  if (leftRepo || rightRepo) return Boolean(leftRepo && rightRepo && leftRepo.toLowerCase() === rightRepo.toLowerCase());
+
+  const leftUrl = normalizeUrl(left.url);
+  const rightUrl = normalizeUrl(right.url);
+  if (leftUrl || rightUrl) return Boolean(leftUrl && rightUrl && leftUrl === rightUrl);
+
+  const leftCloneUrl = normalizeUrl(left.cloneUrl);
+  const rightCloneUrl = normalizeUrl(right.cloneUrl);
+  if (leftCloneUrl || rightCloneUrl) return Boolean(leftCloneUrl && rightCloneUrl && leftCloneUrl === rightCloneUrl);
+
+  return false;
 }
 
 function isWhitelisted(item: Pick<SkillWhitelistEntry, "name" | "url" | "cloneUrl">, whitelist: SkillWhitelistEntry[]) {
@@ -448,16 +468,64 @@ type GithubRepo = {
   disabled?: boolean;
 };
 
-export async function searchGithubSkills(query: string): Promise<SkillSearchResult[]> {
-  const search = encodeURIComponent(`${query || "agent skills"} skill OR skills`);
-  const response = await fetch(`https://api.github.com/search/repositories?q=${search}&sort=stars&order=desc&per_page=10`, {
-    headers: { accept: "application/vnd.github+json" }
-  });
-  if (!response.ok) throw new Error(`GitHub search failed: ${response.status}`);
+const githubSearchCache = new Map<string, { expiresAt: number; items: GithubRepo[] }>();
 
+function githubSearchTimeoutMs() {
+  const value = Number(process.env.HERMES_GITHUB_SEARCH_TIMEOUT_MS ?? 10_000);
+  return Number.isFinite(value) && value > 0 ? value : 10_000;
+}
+
+function githubSearchCacheTtlMs() {
+  const value = Number(process.env.HERMES_GITHUB_SEARCH_CACHE_TTL_MS ?? 60_000);
+  return Number.isFinite(value) && value >= 0 ? value : 60_000;
+}
+
+function githubRateLimitError(response: Response) {
+  const remaining = response.headers.get("x-ratelimit-remaining");
+  const reset = response.headers.get("x-ratelimit-reset");
+  if (response.status !== 403 && response.status !== 429) return undefined;
+  if (remaining !== "0" && response.status !== 429) return undefined;
+
+  const resetAt = reset && Number.isFinite(Number(reset)) ? new Date(Number(reset) * 1000).toISOString() : undefined;
+  return new Error(`GitHub search rate limit exceeded${resetAt ? `; reset at ${resetAt}` : ""}.`);
+}
+
+async function fetchGithubSkillRepos(query: string): Promise<GithubRepo[]> {
+  const cacheKey = query.trim().toLowerCase() || "agent skills";
+  const cached = githubSearchCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.items;
+
+  const search = encodeURIComponent(`${query || "agent skills"} skill OR skills`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), githubSearchTimeoutMs());
+  try {
+    const response = await fetch(`https://api.github.com/search/repositories?q=${search}&sort=stars&order=desc&per_page=10`, {
+      headers: githubApiHeaders(),
+      signal: controller.signal
+    });
+    const rateLimitError = githubRateLimitError(response);
+    if (rateLimitError) throw rateLimitError;
+    if (!response.ok) throw new Error(`GitHub search failed: ${response.status}`);
+
+    const data = (await response.json()) as { items?: GithubRepo[] };
+    const items = data.items ?? [];
+    const ttl = githubSearchCacheTtlMs();
+    if (ttl > 0) githubSearchCache.set(cacheKey, { expiresAt: Date.now() + ttl, items });
+    return items;
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`GitHub search timed out after ${githubSearchTimeoutMs()}ms.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function searchGithubSkills(query: string): Promise<SkillSearchResult[]> {
   const whitelist = await readSkillWhitelist();
-  const data = (await response.json()) as { items?: GithubRepo[] };
-  return (data.items ?? []).map((item) => {
+  const repos = await fetchGithubSkillRepos(query);
+  return repos.map((item) => {
     const name = item.full_name || "unknown/repository";
     const whitelisted = isWhitelisted({ name, url: item.html_url, cloneUrl: item.clone_url }, whitelist);
     return {

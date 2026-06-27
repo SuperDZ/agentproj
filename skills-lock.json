@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "code-review": {
+      "source": "microsoft/vscode",
+      "sourceType": "github",
+      "skillPath": "src/vs/sessions/skills/code-review/SKILL.md",
+      "computedHash": "58f5b659319a240c102a3aaa7651e45617604df6bd044ffa979b974d5252372e"
+    }
+  }
+}
