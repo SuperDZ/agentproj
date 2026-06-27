@@ -1,6 +1,6 @@
 import Link from "next/link";
 import type React from "react";
-import { Activity, Archive, ArrowLeft, Boxes, Database, Server, TriangleAlert, WalletCards } from "lucide-react";
+import { Activity, Archive, ArrowLeft, Boxes, Database, Server, ShieldCheck, TriangleAlert, WalletCards } from "lucide-react";
 import { prisma } from "@/lib/db/prisma";
 import { Badge, Card, Progress } from "@/components/ui";
 
@@ -8,16 +8,19 @@ export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 export default async function OpsPage() {
-  const [tasks, deadTasks, heartbeats, errors, modelInvocations, artifactStats] = await Promise.all([
+  const [tasks, deadTasks, heartbeats, errors, modelInvocations, artifactStats, agentReviewState] = await Promise.all([
     prisma.asyncTask.findMany({ orderBy: { updatedAt: "desc" }, take: 20 }),
     prisma.asyncTask.findMany({ where: { status: { in: ["failed", "dead"] } }, orderBy: { updatedAt: "desc" }, take: 10 }),
     prisma.workerHeartbeat.findMany({ orderBy: { lastSeenAt: "desc" }, take: 10 }),
     prisma.operationalEvent.findMany({ where: { level: { in: ["error", "warn"] } }, orderBy: { createdAt: "desc" }, take: 12 }),
     prisma.modelInvocation.findMany({ orderBy: { createdAt: "desc" }, take: 200 }),
-    prisma.storedArtifact.aggregate({ _count: { _all: true }, _sum: { sizeBytes: true } })
+    prisma.storedArtifact.aggregate({ _count: { _all: true }, _sum: { sizeBytes: true } }),
+    loadOpsAgentReviewState()
   ]);
+  const { agentReviews, agentRuns } = agentReviewState;
 
   const taskCounts = countBy(tasks, (task) => task.status);
+  const blockedReviews = agentReviews.filter((review) => review.decision === "blocked").length;
   const modelTotalTokens = modelInvocations.reduce((sum, item) => sum + (item.totalTokens ?? 0), 0);
   const modelCost = modelInvocations.reduce((sum, item) => sum + (item.estimatedCostUsd ?? 0), 0);
 
@@ -41,12 +44,13 @@ export default async function OpsPage() {
       </header>
 
       <div className="mx-auto grid max-w-7xl gap-6 px-6 py-8">
-        <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+        <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-6">
           <Metric icon={<Boxes className="h-4 w-4" />} label="近期任务" value={String(tasks.length)} helper={`running ${taskCounts.running ?? 0} / waiting ${taskCounts.waiting ?? 0}`} />
           <Metric icon={<TriangleAlert className="h-4 w-4" />} label="失败/死信" value={String(deadTasks.length)} helper="需要人工复核或重放" tone={deadTasks.length ? "risk" : "neutral"} />
           <Metric icon={<Server className="h-4 w-4" />} label="Worker 心跳" value={String(heartbeats.length)} helper={heartbeats[0] ? `最近 ${formatDate(heartbeats[0].lastSeenAt)}` : "暂无心跳"} />
           <Metric icon={<WalletCards className="h-4 w-4" />} label="模型 Token" value={String(modelTotalTokens)} helper={modelCost ? `$${modelCost.toFixed(4)}` : "未记录成本"} />
           <Metric icon={<Archive className="h-4 w-4" />} label="Artifact" value={String(artifactStats._count._all)} helper={formatBytes(artifactStats._sum.sizeBytes ?? 0)} />
+          <Metric icon={<ShieldCheck className="h-4 w-4" />} label="Agent Review" value={String(agentReviews.length)} helper={`${blockedReviews} blocked`} tone={blockedReviews ? "risk" : "neutral"} />
         </section>
 
         <section className="grid gap-6 xl:grid-cols-[1.2fr_0.8fr]">
@@ -86,6 +90,44 @@ export default async function OpsPage() {
                 </div>
               ))}
               {heartbeats.length === 0 ? <p className="rounded-lg bg-stone-100 p-3 text-sm text-stone-500">暂无 worker 心跳。</p> : null}
+            </div>
+          </Card>
+        </section>
+
+        <section className="grid gap-6 xl:grid-cols-2">
+          <Card>
+            <SectionTitle icon={<ShieldCheck className="h-5 w-5" />} title="Agent Review" />
+            <div className="mt-4 grid gap-3">
+              {agentReviews.slice(0, 6).map((review) => (
+                <div key={review.id} className="rounded-lg border border-stone-200 bg-white/80 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <p className="text-sm font-semibold text-stone-950">{review.project.name} / {review.targetType} / round {review.round}</p>
+                      <p className="mt-1 font-mono text-[11px] text-stone-500">{review.id}</p>
+                    </div>
+                    <Badge tone={taskTone(review.status)}>{review.decision || review.status}</Badge>
+                  </div>
+                  <p className="mt-2 text-xs text-stone-500">runs {review.completedRunCount}/{review.expectedRunCount} / {formatDate(review.updatedAt)}</p>
+                </div>
+              ))}
+              {agentReviews.length === 0 ? <p className="rounded-lg bg-stone-100 p-3 text-sm text-stone-500">暂无 Agent Review。</p> : null}
+            </div>
+          </Card>
+
+          <Card>
+            <SectionTitle icon={<ShieldCheck className="h-5 w-5" />} title="AgentRun" />
+            <div className="mt-4 grid gap-2">
+              {agentRuns.slice(0, 8).map((run) => (
+                <div key={run.id} className="rounded-md border border-stone-200 bg-white/80 p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="truncate text-sm font-semibold text-stone-950">{run.agentKey}</p>
+                    <Badge tone={taskTone(run.status)}>{run.status}</Badge>
+                  </div>
+                  <p className="mt-1 font-mono text-[11px] text-stone-500">{run.id}</p>
+                  <p className="mt-2 text-xs text-stone-500">retry {run.retryCount}/{run.maxRetries} / {formatDate(run.updatedAt)}</p>
+                </div>
+              ))}
+              {agentRuns.length === 0 ? <p className="rounded-lg bg-stone-100 p-3 text-sm text-stone-500">暂无 AgentRun。</p> : null}
             </div>
           </Card>
         </section>
@@ -165,11 +207,31 @@ function countBy<T>(items: T[], getKey: (item: T) => string) {
   }, {});
 }
 
+async function loadOpsAgentReviewState() {
+  try {
+    const [agentReviews, agentRuns] = await Promise.all([
+      prisma.agentReview.findMany({ orderBy: { createdAt: "desc" }, take: 12, include: { project: true } }),
+      prisma.agentRun.findMany({ orderBy: { updatedAt: "desc" }, take: 20 })
+    ]);
+    return { agentReviews, agentRuns };
+  } catch (error) {
+    if (isMissingAgentReviewSchema(error)) return { agentReviews: [], agentRuns: [] };
+    throw error;
+  }
+}
+
+function isMissingAgentReviewSchema(error: unknown) {
+  const code = typeof error === "object" && error && "code" in error ? String((error as { code?: unknown }).code) : "";
+  if (code === "P2021" || code === "P2022") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /AgentReview|AgentRun|AgentConsensus|does not exist|not exist in the current database/i.test(message);
+}
+
 function taskTone(status: string): "green" | "yellow" | "red" | "blue" | "slate" {
-  if (status === "succeeded") return "green";
-  if (status === "failed" || status === "dead") return "red";
-  if (status === "running") return "blue";
-  if (status === "queued" || status === "waiting") return "yellow";
+  if (status === "succeeded" || status === "passed" || status === "pass") return "green";
+  if (status === "failed" || status === "dead" || status === "blocked") return "red";
+  if (status === "running" || status === "synthesizing") return "blue";
+  if (status === "queued" || status === "waiting" || status === "needs_revision") return "yellow";
   return "slate";
 }
 

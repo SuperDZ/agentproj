@@ -28,6 +28,7 @@ model Project {
   monitorJobs  MonitorJob[]
   reports      MonitorReport[]
   asyncTasks   AsyncTask[]
+  agentReviews AgentReview[]
   operationalEvents OperationalEvent[]
   modelInvocations ModelInvocation[]
 }
@@ -127,10 +128,146 @@ model AsyncTask {
   attempts      AsyncTaskAttempt[]
   events        OperationalEvent[]
   spans         TraceSpan[]
+  agentRuns     AgentRun[]
+  agentConsensuses AgentConsensus[]
 
   @@index([status, runAfter, priority, createdAt])
   @@index([projectId, type, status])
   @@index([lockedBy, lockExpiresAt])
+}
+
+model AgentReview {
+  id                  String           @id @default(cuid())
+  projectId           String
+  targetType          String
+  targetArtifactId    String?
+  targetChecksum      String?
+  status              String           @default("queued")
+  decision            String?
+  round               Int              @default(1)
+  expectedRunCount    Int              @default(0)
+  completedRunCount   Int              @default(0)
+  synthesizeTaskId    String?          @unique
+  synthesizeStartedAt DateTime?
+  snapshotArtifactId  String?
+  latestConsensusId   String?
+  createdBy           String?
+  startedAt           DateTime?
+  endedAt             DateTime?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  project             Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  runs                AgentRun[]
+  findings            AgentFinding[]
+  consensuses         AgentConsensus[]
+
+  @@unique([projectId, targetType, round])
+  @@index([projectId, targetType, createdAt])
+  @@index([status, createdAt])
+  @@index([decision, createdAt])
+}
+
+model AgentRun {
+  id                 String          @id @default(cuid())
+  projectId          String
+  reviewId           String
+  taskId             String?
+  agentKey           String
+  role               String
+  status             String          @default("queued")
+  inputArtifactId    String?
+  outputJson         Json?
+  outputArtifactId   String?
+  traceId            String?
+  promptVersion      String
+  model              String?
+  retryCount         Int             @default(0)
+  maxRetries         Int             @default(5)
+  lastErrorCode      String?
+  lastErrorMessage   String?
+  isRetriedRun       Boolean         @default(false)
+  supersededByRunId  String?
+  startedAt          DateTime?
+  endedAt            DateTime?
+  durationMs         Int?
+  errorCode          String?
+  errorMessage       String?
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  review             AgentReview     @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  task               AsyncTask?      @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  findings           AgentFinding[]
+
+  @@index([projectId, createdAt])
+  @@index([reviewId, agentKey, createdAt])
+  @@index([taskId])
+  @@index([status, createdAt])
+}
+
+model AgentFinding {
+  id                  String                    @id @default(cuid())
+  projectId           String
+  reviewId            String
+  agentRunId          String?
+  severity            String
+  category            String
+  title               String
+  description         String
+  evidenceJson        Json?
+  recommendation      String?
+  confidence          Float?
+  status              String                    @default("open")
+  dedupeKey           String
+  isConsensusFinding  Boolean                   @default(false)
+  mergedIntoFindingId String?
+  createdAt           DateTime                  @default(now())
+  updatedAt           DateTime                  @updatedAt
+
+  review              AgentReview               @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  agentRun            AgentRun?                 @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
+  consensusLinks      AgentConsensusFinding[]
+
+  @@index([projectId, createdAt])
+  @@index([reviewId, severity, status])
+  @@index([reviewId, dedupeKey])
+  @@index([agentRunId])
+}
+
+model AgentConsensus {
+  id               String                   @id @default(cuid())
+  projectId        String
+  reviewId         String
+  taskId           String?
+  decision         String
+  summary          String
+  outputArtifactId String?
+  ruleResultJson   Json?
+  createdAt        DateTime                 @default(now())
+
+  review           AgentReview              @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  task             AsyncTask?               @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  findings         AgentConsensusFinding[]
+
+  @@index([projectId, createdAt])
+  @@index([reviewId, createdAt])
+  @@index([taskId])
+  @@index([decision, createdAt])
+}
+
+model AgentConsensusFinding {
+  id          String         @id @default(cuid())
+  consensusId String
+  findingId   String
+  rank        Int?
+  createdAt   DateTime       @default(now())
+
+  consensus   AgentConsensus @relation(fields: [consensusId], references: [id], onDelete: Cascade)
+  finding     AgentFinding   @relation(fields: [findingId], references: [id], onDelete: Cascade)
+
+  @@unique([consensusId, findingId])
+  @@index([findingId])
 }
 
 model AsyncTaskAttempt {

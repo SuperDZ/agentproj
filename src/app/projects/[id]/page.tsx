@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowLeft, Boxes, CheckCircle2, ClipboardList, Code2, FileText, FlaskConical, Layers3, ScrollText, Sparkles } from "lucide-react";
+import { ArrowLeft, Boxes, CheckCircle2, ClipboardList, Code2, FileText, FlaskConical, Layers3, ScrollText, ShieldCheck, Sparkles } from "lucide-react";
 import { CodexPackActions } from "@/components/codex-pack-actions";
 import { HermesControlPanel } from "@/components/hermes-control-panel";
 import { ResearchRunStatus } from "@/components/research-run-status";
@@ -24,6 +24,7 @@ const workflowSteps = [
   { label: "PRD", id: "prd", icon: FileText },
   { label: "技术栈", id: "tech-stack", icon: Boxes },
   { label: "PDRS", id: "pdrs", icon: CheckCircle2 },
+  { label: "Agent Review", id: "agent-review", icon: ShieldCheck },
   { label: "Codex Pack", id: "codex-pack", icon: Code2 },
   { label: "原型", id: "prototype", icon: Sparkles }
 ];
@@ -41,6 +42,7 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
     }
   });
   if (!project) notFound();
+  const agentReviewState = await loadProjectAgentReviewState(project.id);
 
   const research = getLatestResearch(project);
   const latestRun = project.researchRuns[0];
@@ -60,6 +62,8 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
   const exportAction = exportCodexPack.bind(null, project.id);
   const selectStackAction = selectTechStack.bind(null, project.id);
   const currentScore = latestEvaluation?.pdrs ?? evaluation.pdrs;
+  const latestAgentReview = agentReviewState.reviews[0];
+  const codexBlocked = agentReviewState.latestCodexReview?.decision === "blocked";
 
   return (
     <main className="min-h-screen">
@@ -239,11 +243,53 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
             </div>
           </Card>
 
+          <Card id="agent-review">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <SectionTitle title="Agent Review" subtitle="并行专家 Agent 审查 PRD、技术栈、测试风险和发布风险，生成可追溯门禁结论。" />
+              <WorkflowActionButton
+                label="运行 Codex Pack 审查"
+                endpoint={`/api/projects/${project.id}/agent-reviews`}
+                stages={["创建冻结快照", "分发专家 Agent", "等待并行审查", "生成 consensus"]}
+                body={{ targetType: "codex_pack", mode: "default", force: true }}
+                background
+                disabled={!prd || !agentReviewState.available}
+                disabledReason={agentReviewState.available ? "请先生成或保存 PRD。" : "Agent Review 数据表尚未迁移，请先执行 Prisma migration。"}
+                className={buttonStyles.primary}
+              />
+            </div>
+            <div className="mt-4 grid gap-3">
+              {latestAgentReview ? (
+                <div className="rounded-lg border border-stone-200 bg-white/80 p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-bold text-stone-950">{latestAgentReview.targetType} / round {latestAgentReview.round}</p>
+                      <p className="mt-1 font-mono text-xs text-stone-500">{latestAgentReview.id}</p>
+                    </div>
+                    <Badge tone={reviewTone(latestAgentReview.status)}>{latestAgentReview.decision || latestAgentReview.status}</Badge>
+                  </div>
+                  <div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+                    {latestAgentReview.runs.map((run) => (
+                      <div key={run.id} className="rounded-md border border-stone-200 bg-stone-50 p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="truncate text-xs font-bold text-stone-900">{run.agentKey}</p>
+                          <Badge tone={reviewTone(run.status)}>{run.status}</Badge>
+                        </div>
+                        {run.errorMessage ? <p className="mt-2 line-clamp-2 text-xs text-rose-700">{run.errorMessage}</p> : null}
+                      </div>
+                    ))}
+                  </div>
+                  {latestAgentReview.consensuses[0] ? <p className="mt-4 rounded-md bg-stone-100 p-3 text-sm leading-6 text-stone-700">{latestAgentReview.consensuses[0].summary}</p> : null}
+                </div>
+              ) : <p className="rounded-lg bg-stone-100 p-4 text-sm text-stone-500">尚未运行 Agent Review。</p>}
+            </div>
+          </Card>
+
           <Card id="codex-pack">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <SectionTitle title="Codex Pack" subtitle="使用已选技术栈生成实现任务、提示词和验收标准。" />
-              <form action={exportAction}><button className={buttonStyles.primary}>导出 Codex Pack</button></form>
+              <form action={exportAction}><button disabled={codexBlocked} className={buttonStyles.primary}>导出 Codex Pack</button></form>
             </div>
+            {codexBlocked ? <p className="mt-4 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800">Agent Review 当前结论为 blocked，已阻止 Codex Pack 导出。请处理高风险 finding 后重跑审查。</p> : null}
             <div className="mt-4 grid gap-3">
               {codexArtifacts.length > 0 ? (
                 <>
@@ -300,4 +346,49 @@ function Score({ label, value }: { label: string; value: number }) {
 
 function artifact(project: { artifacts: Array<{ artifactType: string; content: string }> }, type: string) {
   return project.artifacts.find((item) => item.artifactType === type)?.content || "";
+}
+
+async function loadProjectAgentReviewState(projectId: string) {
+  try {
+    const [reviews, latestCodexReview] = await Promise.all([
+      prisma.agentReview.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+        take: 3,
+        include: {
+          runs: { orderBy: { createdAt: "asc" } },
+          consensuses: { orderBy: { createdAt: "desc" }, take: 1 }
+        }
+      }),
+      prisma.agentReview.findFirst({
+        where: {
+          projectId,
+          targetType: "codex_pack",
+          status: { notIn: ["superseded", "cancelled"] }
+        },
+        orderBy: [{ round: "desc" }, { createdAt: "desc" }]
+      })
+    ]);
+    return { available: true, reviews, latestCodexReview };
+  } catch (error) {
+    if (isMissingAgentReviewSchema(error)) {
+      return { available: false, reviews: [], latestCodexReview: null };
+    }
+    throw error;
+  }
+}
+
+function isMissingAgentReviewSchema(error: unknown) {
+  const code = typeof error === "object" && error && "code" in error ? String((error as { code?: unknown }).code) : "";
+  if (code === "P2021" || code === "P2022") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /AgentReview|AgentRun|AgentConsensus|does not exist|not exist in the current database/i.test(message);
+}
+
+function reviewTone(status: string): "green" | "yellow" | "red" | "blue" | "slate" {
+  if (status === "passed" || status === "pass" || status === "succeeded") return "green";
+  if (status === "blocked" || status === "failed" || status === "dead") return "red";
+  if (status === "running" || status === "synthesizing") return "blue";
+  if (status === "queued" || status === "needs_revision") return "yellow";
+  return "slate";
 }

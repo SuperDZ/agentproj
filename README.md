@@ -11,6 +11,7 @@ SpecFlow Agent 是一个本地优先的 AI Coding 产品决策系统。它在 AI
 -> 差异化评估
 -> PRD 生成
 -> PDRS 评分门禁
+-> 多 Agent 并行专家审查
 -> Codex Pack 导出
 -> 轻量级竞品监控计划
 ```
@@ -27,6 +28,7 @@ SpecFlow Agent 是一个本地优先的 AI Coding 产品决策系统。它在 AI
 - PostgreSQL（默认业务数据库）
 - Redis（缓存、限流、幂等键和 worker 唤醒信号；不保存核心任务状态）
 - Hermes adapter，支持 `mock`、`real`、`local` 三种模式
+- 多 Agent Review Runtime（并行专家审查、冻结上下文、确定性门禁和 Synthesizer 汇总）
 - `project-flow` 共享服务层，复用 Server Actions 和 API routes 的业务流程
 - Zod JSON schema 校验
 - Vitest 单元测试
@@ -37,8 +39,89 @@ SpecFlow Agent 是一个本地优先的 AI Coding 产品决策系统。它在 AI
 
 - AsyncTask：`AsyncTask`、`AsyncTaskAttempt`、`WorkerHeartbeat` 负责 durable queue、重试、租约恢复和 worker 心跳。任务状态以 PostgreSQL 为准，Redis 只负责唤醒信号和短期幂等键。
 - Redis Cache：缓存项目列表、项目详情、Skills inventory 和 GitHub Skill search 结果；同时用于 GitHub Skill search 限流和 `research:start:{projectId}` 防连点。
-- Observability：`OperationalEvent`、`MetricSample`、`TraceSpan`、`ModelInvocation` 记录结构化日志、指标、链路片段和模型调用 token/成本信息。`/ops` 页面展示最近任务、dead/failed 任务、worker 心跳、错误日志、模型调用和 Artifact 占用。
+- Observability：`OperationalEvent`、`MetricSample`、`TraceSpan`、`ModelInvocation` 记录结构化日志、指标、链路片段和模型调用 token/成本信息。`/ops` 页面展示最近任务、dead/failed 任务、worker 心跳、错误日志、模型调用、Agent Review 和 Artifact 占用。
 - Artifact Storage：小文本继续写入数据库，大文件写入 `ARTIFACT_STORAGE_DIR`。数据库只保存 metadata、checksum、版本和下载信息；删除项目时会同步清理本地 artifact 目录。
+- Agent Review：`AgentReview`、`AgentRun`、`AgentFinding`、`AgentConsensus`、`AgentConsensusFinding` 持久化多 Agent 审查过程。Agent 只读冻结 snapshot，只写 finding、consensus 和 artifact，不直接修改 Project、ResearchRun、Evaluation 等核心事实表。
+
+## 多 Agent Review
+
+当前多 Agent 能力采用“并行专家评审”路线，不引入 LangGraph、CrewAI、AutoGen 等外部编排框架。执行层仍复用 `AsyncTask`，事实源仍是 PostgreSQL，Redis 只作为通知和短期计数加速。
+
+### 核心对象
+
+- `AgentReview`：一轮审查的父实体，保存 `targetType`、`round`、`status`、`decision`、snapshot artifact、synthesize task 和计数信息。
+- `AgentRun`：某个专家 Agent 在该轮审查中的一次运行，保存 agent key、角色、prompt version、trace、输出 artifact、错误和重试状态。
+- `AgentFinding`：结构化问题记录，包含 severity、category、evidence、recommendation、confidence 和 dedupe key。
+- `AgentConsensus`：Synthesizer 汇总后的统一结论。
+- `AgentConsensusFinding`：Consensus 与去重后 finding 的关系表，用于排名、查询和门禁统计。
+
+### 默认 Agent
+
+- `research-agent`：检查研究完整性、事实一致性和竞品覆盖。
+- `product-agent`：检查 PRD、用户价值、需求边界和验收标准。
+- `architecture-agent`：检查模块边界、存储、异步任务和可扩展性。
+- `engineering-agent`：检查实现复杂度、类型约束、错误处理和可维护性。
+- `qa-agent`：检查测试覆盖、回归风险和边界场景。
+- `release-agent`：检查迁移、环境变量、部署和回滚风险。
+- `synthesizer-agent`：只负责汇总，不直接生成新事实。
+
+### 执行策略
+
+每轮 review 创建时会生成 `agent-review-context-{reviewId}.json` 冻结快照。每个 Agent 在 `registry.ts` 中声明 `contextKeys`，runtime 会按需裁剪上下文，避免所有 Agent 吞全量 snapshot。
+
+任务类型：
+
+```text
+agent.review.parallel
+agent.review.run
+agent.review.synthesize
+```
+
+`agent.review.parallel` 分发子任务，`agent.review.run` 并行执行专家 Agent，`agent.review.synthesize` 进行去重、冲突归纳和门禁决策。系统使用 Redis remaining counter 作为加速信号，但最终是否触发 synthesize 由 PostgreSQL 中的 AgentRun 终态决定。
+
+门禁结论由确定性规则和 Synthesizer 共同产生：
+
+```text
+finalDecision = max(ruleDecision, synthesizerSuggestedDecision)
+```
+
+LLM 不能把确定性规则判定的严重风险降级。当前规则包括：
+
+- 存在 critical open consensus finding：`blocked`
+- high open consensus finding >= 2：`blocked`
+- high open consensus finding = 1：`needs_revision`
+- medium open consensus finding >= 3：`needs_revision`
+- failed AgentRun >= 2：`needs_revision`
+- release target 缺少成功的 `release-agent`：`blocked`
+
+Codex Pack 导出会检查最新有效的 `research`、`prd`、`codex_pack` review。只有最新有效 review 为 `blocked` 时才阻止导出；历史 blocked review 被新一轮 pass/needs_revision review supersede 后，不再永久阻塞。
+
+### API
+
+```text
+POST /api/projects/:id/agent-reviews
+GET  /api/projects/:id/agent-reviews
+GET  /api/projects/:id/agent-reviews/:reviewId
+POST /api/projects/:id/agent-reviews/:reviewId/rerun
+POST /api/projects/:id/agent-reviews/:reviewId/runs/:runId/retry
+GET  /api/projects/:id/agent-reviews/:reviewId/findings
+```
+
+创建请求：
+
+```json
+{
+  "targetType": "codex_pack",
+  "targetArtifactId": "optional artifact id",
+  "agentKeys": ["optional-agent-key"],
+  "mode": "default",
+  "force": false
+}
+```
+
+`targetType` 可选：`research`、`prd`、`codex_pack`、`release`、`ppt`。`mode` 可选：`fast`、`default`、`strict`。
+
+`force=true` 会创建新一轮 review，并在新 review 成功入队后把同 target 的旧有效 review 标记为 `superseded`。单个 failed AgentRun 可以通过 retry API 在当前 round 内恢复，不强制作废整轮 review。
 
 ## 本地运行
 
@@ -55,7 +138,7 @@ npm run dev
 
 Hermes 研究任务使用 PostgreSQL durable queue。点击“运行 Hermes 研究”会创建或复用 `ResearchRun`，并创建或复用 `AsyncTask(type=research.run)`；当前 `POST` 请求会在拿到幂等键时推进一次任务。状态读取接口只返回数据库中的当前记录，不会在页面轮询时隐式启动或重复推进任务。
 
-长期运行或批量处理时，也可以另开一个终端启动研究 worker，让它持续领取队列和刷新远程结果：
+长期运行或批量处理时，也可以另开一个终端启动 worker，让它持续领取 `AsyncTask` 队列。当前脚本名仍为 `worker:research`，但它已经能处理 `research.run` 和 `agent.review.*` 任务：
 
 ```bash
 npm run worker:research
@@ -67,7 +150,7 @@ npm run worker:research
 npm run worker:research:once
 ```
 
-没有运行 worker 时，页面点击仍会推进当前项目一次；如果远程 Hermes 任务进入异步 `queued` 或 `running` 状态，需要再次点击或启动 worker 才会继续刷新远程结果。生产、长任务和批量处理场景应运行 worker。
+没有运行 worker 时，页面点击仍会推进当前项目一次；如果远程 Hermes 任务进入异步 `queued` 或 `running` 状态，或者 Agent Review 需要继续执行后续子任务，需要再次点击或启动 worker 才会继续推进。生产、长任务和批量处理场景应运行 worker。
 
 ## Hermes 接入
 
@@ -87,12 +170,19 @@ npm run worker:research:once
 - `ResearchRun` 中 `running` 且没有 `hermesRunId` 的旧任务如果超过恢复阈值，会被重新置为 `queued`；`AsyncTask` 使用 `lockedBy + lockExpiresAt` 做 worker 租约恢复。
 - `local` 模式如果 Hermes CLI 返回不可解析 JSON，会写入 `completed_with_fallback` 状态，并保留 `rawOutput` 供人工复核。
 
-生产或长期运行环境必须同时运行 Web 服务和研究 worker。推荐最少部署两个进程：
+生产或长期运行环境必须同时运行 Web 服务和 worker。推荐最少部署两个进程：
 
 ```bash
 npm run start
 npm run worker:research
 ```
+
+该 worker 会持续处理：
+
+- `research.run`
+- `agent.review.parallel`
+- `agent.review.run`
+- `agent.review.synthesize`
 
 ### 本机 Hermes 源码模式
 
@@ -165,7 +255,7 @@ HERMES_RESEARCH_OUTPUT_PATH_TEMPLATE="/runs/{runId}/output"
 
 ## 运维页面
 
-打开 `/ops` 可以查看生产化运行状态：最近 AsyncTask、dead/failed 任务、worker 心跳、最近错误日志、模型调用次数、token、估算成本以及 Artifact Storage 占用。该页面读取 PostgreSQL 中的可观测性表，不依赖外部 APM 平台。
+打开 `/ops` 可以查看生产化运行状态：最近 AsyncTask、dead/failed 任务、worker 心跳、最近错误日志、模型调用次数、token、估算成本、Agent Review、AgentRun 以及 Artifact Storage 占用。该页面读取 PostgreSQL 中的可观测性表，不依赖外部 APM 平台。
 
 ## 导出内容
 
@@ -183,6 +273,8 @@ Codex Pack 会导出一组面向实现的 Markdown 文件：
 工作区页面支持整体复制导出包，也支持逐文件查看和下载。
 服务端会同时写入 Artifact Storage：Codex Pack 额外生成 `codex-pack.zip`，汇报材料会生成 PPTX、Word 兼容 HTML 和 prompt/package 文件。下载接口为 `GET /api/projects/:id/artifacts/:artifactId/download`，列表接口为 `GET /api/projects/:id/artifacts`。
 
+如果最新有效的 Agent Review 对 `research`、`prd` 或 `codex_pack` 给出 `blocked` 结论，服务端会阻止 Codex Pack 导出。用户需要处理高风险 finding，并重新运行对应 review，使最新有效结论不再是 `blocked`。
+
 ## 测试与验收
 
 ```bash
@@ -191,6 +283,7 @@ npm run lint
 npm run build
 npx tsc --noEmit
 npx prisma validate
+npx prisma migrate deploy
 npm audit --audit-level=high
 ```
 
@@ -208,13 +301,21 @@ React 19 运行时能力可用以下命令验证：
 node -e "const React=require('react'); process.exit(typeof React.useActionState === 'function' ? 0 : 1)"
 ```
 
-研究 worker 的单轮处理可用以下命令验证：
+worker 的单轮处理可用以下命令验证：
 
 ```bash
 npm run worker:research:once
 ```
 
-注意：该命令会真实领取当前数据库中的 `queued` 任务，或刷新已经持久化 `hermesRunId` 的 `running` 任务。仅在确认当前数据库任务可被处理时执行。
+注意：该命令会真实领取当前数据库中的 `queued` 任务，可能刷新已经持久化 `hermesRunId` 的 `running` 研究任务，也可能推进 Agent Review 子任务。仅在确认当前数据库任务可被处理时执行。
+
+Agent Review 的最小验收路径：
+
+1. 在项目详情页生成或保存 PRD。
+2. 点击 `Agent Review` 区域的“运行 Codex Pack 审查”。
+3. 启动 `npm run worker:research` 或执行 `npm run worker:research:once` 推进队列。
+4. 在项目页查看各 AgentRun 状态和 consensus。
+5. 在 `/ops` 查看 Agent Review、AgentRun、模型调用和错误日志。
 
 当前 code review 报告见：
 
@@ -230,4 +331,6 @@ npm run worker:research:once
 6. 无法解析的 local Hermes 输出会进入 `completed_with_fallback`，需要人工复核。
 7. PDRS 评分由本地规则引擎计算。
 8. 金融类产品输出不得承诺收益、本金保护、确定性结果或无风险。
-9. Hermes terminal、browser、file tools 在未来启用前必须经过审批，并运行在隔离环境中。
+9. Agent Review 只读冻结 snapshot，只写 AgentRun、AgentFinding、AgentConsensus 和 Artifact，不直接修改核心业务事实表。
+10. Synthesizer 不能把确定性 gate policy 判定的严重风险降级。
+11. Hermes terminal、browser、file tools 在未来启用前必须经过审批，并运行在隔离环境中。

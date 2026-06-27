@@ -71,6 +71,17 @@ export async function cacheDelete(key: string) {
   }, false);
 }
 
+export async function redisSetNumber(key: string, value: number, ttlSeconds = defaultTtlSeconds()) {
+  return withRedis(async (client) => {
+    await client.set(key, String(value), "EX", ttlSeconds);
+    return true;
+  }, false);
+}
+
+export async function redisDecrement(key: string) {
+  return withRedis<number | null>(async (client) => client.decr(key), null);
+}
+
 export async function acquireIdempotencyKey(key: string, ttlSeconds = 30) {
   return withRedis(async (client) => {
     const result = await client.set(`idempotency:${key}`, "1", "EX", ttlSeconds, "NX");
