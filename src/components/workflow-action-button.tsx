@@ -1,5 +1,6 @@
 "use client";
 
+import { RotateCcw } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useState, useTransition } from "react";
 
@@ -13,6 +14,7 @@ type WorkflowActionButtonProps = {
   disabledReason?: string;
   background?: boolean;
   body?: unknown;
+  iconOnly?: boolean;
 };
 
 type ActionState = {
@@ -30,7 +32,7 @@ const fallbackText = {
   submitted: "已提交后台运行"
 };
 
-export function WorkflowActionButton({ label, endpoint, stages, className, pollEndpoint, disabled, disabledReason, background, body }: WorkflowActionButtonProps) {
+export function WorkflowActionButton({ label, endpoint, stages, className, pollEndpoint, disabled, disabledReason, background, body, iconOnly }: WorkflowActionButtonProps) {
   const router = useRouter();
   const [, startTransition] = useTransition();
   const [state, setState] = useState<ActionState>({ phase: "idle", stage: "" });
@@ -93,6 +95,27 @@ export function WorkflowActionButton({ label, endpoint, stages, className, pollE
     } finally {
       if (timer) window.clearInterval(timer);
     }
+  }
+
+  if (iconOnly) {
+    const isRunning = state.phase === "running";
+    return (
+      <span className="group relative inline-flex">
+        <button
+          type="button"
+          onClick={run}
+          disabled={disabled || isRunning}
+          aria-label={label}
+          title={label}
+          className={className}
+        >
+          <RotateCcw className={isRunning ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
+        </button>
+        <span className="pointer-events-none absolute left-1/2 top-full z-20 mt-2 -translate-x-1/2 whitespace-nowrap rounded-md border border-stone-200 bg-stone-950 px-2 py-1 text-xs font-semibold text-white opacity-0 shadow-lg transition group-hover:opacity-100 group-focus-within:opacity-100">
+          {label}
+        </span>
+      </span>
+    );
   }
 
   return (

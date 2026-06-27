@@ -118,7 +118,7 @@ function UsageTable({ title, items }: { title: string; items: HermesResourceUsag
                   {item.name}
                   {item.path ? <p className="mt-1 break-all font-mono text-[11px] font-normal text-stone-500">{item.path}</p> : null}
                 </td>
-                <td className="p-3 font-mono text-stone-700">{item.callCount}</td>
+                <td className="p-3 font-mono text-stone-700">{item.callCount === undefined ? "未返回" : item.callCount}</td>
                 <td className="p-3 text-stone-700">{statusLabel(item.status)}</td>
                 <td className="p-3 text-xs leading-5 text-stone-600">{item.reason || item.purpose?.join("、") || "未返回说明。"}</td>
               </tr>

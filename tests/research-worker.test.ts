@@ -46,6 +46,9 @@ function matchesTask(task: Record<string, unknown>, where: Record<string, unknow
   if (where.projectId && task.projectId !== where.projectId) return false;
   if (where.type && task.type !== where.type) return false;
   if ("lockedBy" in where && task.lockedBy !== where.lockedBy) return false;
+  if (where.payloadJson && typeof where.payloadJson === "object" && "contains" in where.payloadJson) {
+    if (!String(task.payloadJson || "").includes(String(where.payloadJson.contains))) return false;
+  }
   if (where.status) {
     const condition = where.status;
     if (condition && typeof condition === "object" && "in" in condition) {
@@ -416,6 +419,53 @@ describe("research worker", () => {
     expect(result?.id).toBe("run_existing");
     expect(state.researchRuns).toHaveLength(1);
     expect(cacheMock.acquireIdempotencyKey).toHaveBeenCalledWith("research:start:p1", 10);
+  });
+
+  it("does not reuse an active research task that belongs to an older terminal run", async () => {
+    state.researchRuns.push({
+      id: "run_old",
+      projectId: "p1",
+      hermesRunId: "hermes_old",
+      mode: "real",
+      status: "completed_without_output",
+      inputPrompt: "old prompt",
+      rawOutput: null,
+      parsedOutputJson: null,
+      createdAt: new Date("2026-06-01T00:00:00.000Z"),
+      completedAt: new Date("2026-06-01T00:01:00.000Z")
+    });
+    state.asyncTasks.push({
+      id: "task_old",
+      type: "research.run",
+      projectId: "p1",
+      status: "waiting",
+      payloadJson: JSON.stringify({ researchRunId: "run_old" }),
+      resultJson: null,
+      priority: 10,
+      attemptCount: 0,
+      maxAttempts: 3,
+      runAfter: new Date(Date.now() + 60_000),
+      lockedBy: null,
+      lockExpiresAt: null,
+      lastError: null,
+      createdAt: new Date("2026-06-01T00:00:10.000Z"),
+      updatedAt: new Date("2026-06-01T00:00:10.000Z"),
+      completedAt: null
+    });
+    hermesMock.createResearchRun.mockImplementation(createMockResearchRun);
+
+    const { runProjectResearch } = await import("@/lib/services/project-flow");
+    const result = await runProjectResearch("p1");
+
+    expect(result?.id).toBe("run_2");
+    expect(result?.status).toBe("completed");
+    expect(state.asyncTasks).toHaveLength(2);
+    expect(state.asyncTasks[1]).toMatchObject({
+      type: "research.run",
+      status: "succeeded",
+      payloadJson: JSON.stringify({ researchRunId: "run_2" })
+    });
+    expect(state.asyncTasks[0].status).toBe("waiting");
   });
 
   it("does not let a worker complete a task after losing its lease", async () => {

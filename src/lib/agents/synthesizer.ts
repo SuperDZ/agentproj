@@ -6,6 +6,7 @@ import { generateJsonWithModel } from "@/lib/model/client";
 import { finishSpan, logEvent, startSpan } from "@/lib/observability";
 import { evaluateGatePolicy, maxDecision } from "@/lib/agents/gate-policy";
 import { agentOutputSchema, type AgentDecision, type AgentFindingInput } from "@/lib/agents/schemas";
+import { normalizeAgentOutputForReview } from "@/lib/agents/runtime";
 
 function normalizeDedupeKey(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 180) || "finding";
@@ -133,7 +134,7 @@ export async function synthesizeAgentReview(task: AsyncTask, reviewId: string) {
       decisionSuggestion: rule.decision,
       findings: [] as AgentFindingInput[]
     };
-    const suggested = agentOutputSchema.parse(await generateJsonWithModel({
+    const generated = await generateJsonWithModel({
       system: [
         "You are the synthesizer-agent.",
         "Summarize multi-agent review results and explicitly describe Conflict & Tradeoffs.",
@@ -154,7 +155,8 @@ export async function synthesizeAgentReview(task: AsyncTask, reviewId: string) {
       }, null, 2),
       fallback,
       projectId: review.projectId
-    }));
+    });
+    const suggested = agentOutputSchema.parse(normalizeAgentOutputForReview(generated, "synthesizer-agent", fallback));
     if (await reviewIsInactive(reviewId)) {
       await finishSpan(span, { status: "cancelled", attributes: { reason: "inactive_review_after_model" } });
       return { reviewId, status: "cancelled" as const };

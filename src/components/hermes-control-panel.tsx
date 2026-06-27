@@ -8,6 +8,7 @@ import type { RecommendedSkillSource, SkillInventoryResponse } from "@/lib/skill
 import { parseHermesResourceConfig } from "@/lib/skills/resource-config";
 import { Badge, buttonStyles, fieldStyles } from "@/components/ui";
 import { cn } from "@/lib/utils";
+import { defaultModelForProvider, isModelProvider, modelProviderOptions } from "@/lib/model/providers";
 
 type HermesControlPanelProps = {
   projectId?: string;
@@ -23,8 +24,6 @@ type StatusPayload = {
   pythonDiagnostics?: string;
   provider?: string;
   model?: string;
-  usageMode?: string;
-  codexCliCommand?: string;
   dashboardPid?: number;
   dashboardPids?: number[];
   dashboardPidSource?: "pid-file" | "process-scan" | "none";
@@ -39,9 +38,7 @@ export function HermesControlPanel({ projectId, policies }: HermesControlPanelPr
   const [actionPending, setActionPending] = useState<"start" | "restart" | "stop" | null>(null);
   const [modelForm, setModelForm] = useState({
     provider: "deepseek",
-    model: "deepseek-chat",
-    usageMode: "api",
-    codexCliCommand: "codex"
+    model: "deepseek-chat"
   });
 
   const isRunning = Boolean(status.dashboardPid);
@@ -50,12 +47,11 @@ export function HermesControlPanel({ projectId, policies }: HermesControlPanelPr
   const detailHref = projectId ? `/hermes?projectId=${encodeURIComponent(projectId)}` : "/hermes";
 
   function applyStatus(nextStatus: StatusPayload) {
+    const provider = isModelProvider(nextStatus.provider) ? nextStatus.provider : "deepseek";
     setStatus(nextStatus);
     setModelForm({
-      provider: nextStatus.provider || "deepseek",
-      model: nextStatus.model || "deepseek-chat",
-      usageMode: nextStatus.usageMode || "api",
-      codexCliCommand: nextStatus.codexCliCommand || "codex"
+      provider,
+      model: nextStatus.model || defaultModelForProvider(provider)
     });
     setStatusLoaded(true);
   }
@@ -149,13 +145,12 @@ export function HermesControlPanel({ projectId, policies }: HermesControlPanelPr
       return;
     }
     setStatus((current) => ({ ...current, ...payload }));
+    const provider = isModelProvider(payload.provider) ? payload.provider : modelForm.provider;
     setModelForm({
-      provider: payload.provider || modelForm.provider,
-      model: payload.model || modelForm.model,
-      usageMode: payload.usageMode || modelForm.usageMode,
-      codexCliCommand: payload.codexCliCommand || modelForm.codexCliCommand
+      provider,
+      model: payload.model || modelForm.model
     });
-    setMessage(payload.usageMode === "codex-cli" ? "模型配置已保存；Codex CLI 模式暂未接入本地 Hermes 运行时。" : "模型配置已保存并生效。");
+    setMessage("模型配置已保存并生效。");
   }
 
   return (
@@ -222,21 +217,15 @@ export function HermesControlPanel({ projectId, policies }: HermesControlPanelPr
         <form onSubmit={saveModelConfig} className="rounded-lg border border-stone-200 bg-stone-50/80 p-4">
           <p className="text-sm font-bold text-stone-950">模型与调用配置</p>
           <div className="mt-4 grid gap-3 md:grid-cols-2">
-            <TextInput label="Provider" value={modelForm.provider} disabled={!statusLoaded} onChange={(value) => setModelForm((current) => ({ ...current, provider: value }))} />
+            <ProviderSelect
+              value={modelForm.provider}
+              disabled={!statusLoaded}
+              onChange={(provider) => setModelForm((current) => ({
+                provider,
+                model: current.model === defaultModelForProvider(current.provider) ? defaultModelForProvider(provider) : current.model
+              }))}
+            />
             <TextInput label="Model" value={modelForm.model} disabled={!statusLoaded} onChange={(value) => setModelForm((current) => ({ ...current, model: value }))} />
-            <label className="grid gap-1 text-xs font-semibold text-stone-500">
-              调用方式
-              <select
-                value={modelForm.usageMode}
-                onChange={(event) => setModelForm((current) => ({ ...current, usageMode: event.target.value }))}
-                className={`${fieldStyles} h-10`}
-                disabled={!statusLoaded}
-              >
-                <option value="api">API</option>
-                <option value="codex-cli">Codex CLI</option>
-              </select>
-            </label>
-            <TextInput label="Codex CLI" value={modelForm.codexCliCommand} disabled={!statusLoaded} onChange={(value) => setModelForm((current) => ({ ...current, codexCliCommand: value }))} />
           </div>
           <button disabled={!statusLoaded} className={`${buttonStyles.primary} mt-4`}>
             <Save className="h-4 w-4" />
@@ -275,6 +264,19 @@ function TextInput({ label, value, disabled, onChange }: { label: string; value:
     <label className="grid gap-1 text-xs font-semibold text-stone-500">
       {label}
       <input value={value} onChange={(event) => onChange(event.target.value)} className={`${fieldStyles} h-10`} disabled={disabled} />
+    </label>
+  );
+}
+
+function ProviderSelect({ value, disabled, onChange }: { value: string; disabled: boolean; onChange: (value: string) => void }) {
+  return (
+    <label className="grid gap-1 text-xs font-semibold text-stone-500">
+      Provider
+      <select value={value} onChange={(event) => onChange(event.target.value)} className={`${fieldStyles} h-10`} disabled={disabled}>
+        {modelProviderOptions.map((provider) => (
+          <option key={provider.value} value={provider.value}>{provider.label}</option>
+        ))}
+      </select>
     </label>
   );
 }

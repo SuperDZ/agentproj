@@ -40,7 +40,6 @@ export function ProjectIntakeForm() {
       <input type="hidden" name="monitoring" value="on" />
       <input type="hidden" name="modelProvider" value="deepseek" />
       <input type="hidden" name="modelName" value="deepseek-chat" />
-      <input type="hidden" name="modelUsageMode" value="api" />
 
       <section className="grid gap-3 rounded-lg border border-brand-500/25 bg-white p-4 shadow-sm shadow-blue-950/[0.04] transition duration-200 hover:border-brand-500/45 hover:shadow-md hover:shadow-blue-950/[0.06] focus-within:border-brand-500 focus-within:ring-2 focus-within:ring-brand-500/20">
         <div className="flex gap-3">

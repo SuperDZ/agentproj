@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { hermesPython, readModelConfig, type HermesModelConfig } from "./control";
 import { createMockHermesOutput } from "./mock";
 import { parseHermesResearchOutput } from "./parser";
@@ -25,6 +28,120 @@ function withLocalPythonPath(root: string) {
   const current = process.env.PYTHONPATH;
   const delimiter = process.platform === "win32" ? ";" : ":";
   return current ? `${root}${delimiter}${current}` : root;
+}
+
+type SkillUsageSnapshot = Record<string, { use_count?: number; view_count?: number; patch_count?: number }>;
+
+type LocalUsageSnapshot = {
+  agentLogPath: string;
+  agentLogSize: number;
+  skillUsage: SkillUsageSnapshot;
+};
+
+function hermesHome() {
+  return process.env.HERMES_HOME || path.join(os.homedir(), ".hermes");
+}
+
+function agentLogPath() {
+  return path.join(hermesHome(), "logs", "agent.log");
+}
+
+function skillUsagePath() {
+  return path.join(hermesHome(), "skills", ".usage.json");
+}
+
+async function readJsonFile<T>(filePath: string, fallback: T): Promise<T> {
+  try {
+    return JSON.parse(await fs.readFile(filePath, "utf8")) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+async function captureLocalUsageSnapshot(): Promise<LocalUsageSnapshot> {
+  const logPath = agentLogPath();
+  let agentLogSize = 0;
+  try {
+    agentLogSize = (await fs.stat(logPath)).size;
+  } catch {
+    agentLogSize = 0;
+  }
+  return {
+    agentLogPath: logPath,
+    agentLogSize,
+    skillUsage: await readJsonFile<SkillUsageSnapshot>(skillUsagePath(), {})
+  };
+}
+
+async function readAgentLogDelta(snapshot: LocalUsageSnapshot) {
+  try {
+    const handle = await fs.open(snapshot.agentLogPath, "r");
+    try {
+      const stat = await handle.stat();
+      if (stat.size <= snapshot.agentLogSize) return "";
+      const length = stat.size - snapshot.agentLogSize;
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, snapshot.agentLogSize);
+      return buffer.toString("utf8");
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return "";
+  }
+}
+
+function increment(map: Map<string, number>, name: string) {
+  const normalized = name.trim();
+  if (!normalized) return;
+  map.set(normalized, (map.get(normalized) ?? 0) + 1);
+}
+
+function parseToolUsageFromText(text: string) {
+  const counts = new Map<string, number>();
+  for (const line of text.split(/\r?\n/)) {
+    const completed = line.match(/\btool\s+([A-Za-z0-9_.:-]+)\s+(?:completed|failed|returned error)\b/i);
+    if (completed?.[1]) increment(counts, completed[1]);
+
+    const cliStarted = line.match(/(?:📞\s*)?Tool\s+\d+\s*:\s*([A-Za-z0-9_.:-]+)\s*\(/i);
+    if (cliStarted?.[1]) increment(counts, cliStarted[1]);
+
+    const structured = line.match(/"tool(?:Name|_name)"\s*:\s*"([^"]+)"/i);
+    if (structured?.[1]) increment(counts, structured[1]);
+  }
+  return counts;
+}
+
+function activityCount(value: { use_count?: number; view_count?: number; patch_count?: number } | undefined) {
+  return Number(value?.use_count ?? 0) + Number(value?.view_count ?? 0) + Number(value?.patch_count ?? 0);
+}
+
+function diffSkillUsage(before: SkillUsageSnapshot, after: SkillUsageSnapshot) {
+  const counts = new Map<string, number>();
+  for (const [name, record] of Object.entries(after)) {
+    const delta = activityCount(record) - activityCount(before[name]);
+    if (delta > 0) counts.set(name, delta);
+  }
+  return counts;
+}
+
+function usageItemsFromCounts(counts: Map<string, number>) {
+  return Array.from(counts.entries()).map(([name, callCount]) => ({
+    name,
+    callCount,
+    status: "used" as const,
+    reason: "来自本次本地 Hermes 调用日志。"
+  }));
+}
+
+function notReportedItems(
+  inputItems: Array<{ name: string; path?: string; purpose?: string[] }> | undefined,
+  observed: Map<string, number>,
+  reason: string
+) {
+  return (inputItems ?? [])
+    .filter((item) => !observed.has(item.name))
+    .map((item) => ({ ...item, status: "not_reported" as const, reason }));
 }
 
 export function extractJsonObject(text: string) {
@@ -84,15 +201,28 @@ function buildLocalHermesPrompt(input: CreateResearchRunInput) {
   ].filter(Boolean).join("\n");
 }
 
-function localResourceUsage(input: CreateResearchRunInput): HermesRunResult["resourceUsage"] {
+export function localResourceUsageFromLogs(input: CreateResearchRunInput, rawCliOutput: string, agentLogDelta: string, beforeUsage: SkillUsageSnapshot = {}, afterUsage: SkillUsageSnapshot = {}): HermesRunResult["resourceUsage"] {
+  const toolCounts = parseToolUsageFromText(`${rawCliOutput}\n${agentLogDelta}`);
+  const skillCounts = diffSkillUsage(beforeUsage, afterUsage);
+  const manual = input.resourceMode === "manual";
+  const missingManualSkillReason = "已传给本地 Hermes CLI，但本次 Hermes 调用日志未出现该 Skill 的真实调用记录。";
+  const missingManualToolReason = "已传给本地 Hermes CLI，但本次 Hermes 调用日志未出现该 Tool 的真实调用记录。";
   return {
     mode: input.resourceMode === "auto" ? "auto" : "manual",
-    skills: input.resourceMode === "manual"
-      ? (input.enabledSkills ?? []).map((item) => ({ ...item, callCount: 0, status: "not_reported" as const, reason: "已传给本地 Hermes CLI，CLI 未返回具体调用次数。" }))
-      : [{ name: "local-hermes-auto-skill-selection", callCount: 0, status: "not_reported", reason: "本地 Hermes 自主选择，CLI 未返回具体 Skill 列表。" }],
-    tools: input.resourceMode === "manual"
-      ? (input.enabledTools ?? []).map((item) => ({ ...item, callCount: 0, status: "not_reported" as const, reason: "已传给本地 Hermes CLI，CLI 未返回具体调用次数。" }))
-      : [{ name: "local-hermes-auto-tool-selection", callCount: 0, status: "not_reported", reason: "本地 Hermes 自主选择，CLI 未返回具体 Tool 列表。" }]
+    skills: [
+      ...usageItemsFromCounts(skillCounts),
+      ...(manual ? notReportedItems(input.enabledSkills, skillCounts, missingManualSkillReason) : [])
+    ].concat(!manual && skillCounts.size === 0 ? [{ name: "local-hermes-auto-skill-selection", status: "not_reported" as const, reason: "本地 Hermes 自主选择；当前 CLI 未返回具体 Skill 列表和调用次数。" }] : []),
+    tools: [
+      ...usageItemsFromCounts(toolCounts),
+      ...(manual ? notReportedItems(input.enabledTools, toolCounts, missingManualToolReason) : [])
+    ].concat(!manual && toolCounts.size === 0 ? [{ name: "local-hermes-auto-tool-selection", status: "not_reported" as const, reason: "本地 Hermes 自主选择；当前 CLI 未返回具体 Tool 列表和调用次数。" }] : []),
+    raw: {
+      source: "local-hermes-logs",
+      agentLogPath: agentLogPath(),
+      parsedAgentLogBytes: agentLogDelta.length,
+      parsedCliOutputBytes: rawCliOutput.length
+    }
   };
 }
 
@@ -122,9 +252,6 @@ async function runLocalHermesCli(prompt: string) {
   const command = hermesPython();
   const args = ["-m", "hermes_cli.main"];
   const config = await readModelConfig();
-  if (config.usageMode === "codex-cli") {
-    throw new Error("Codex CLI usage mode is saved but is not supported by the local Hermes CLI runner. Switch usage mode to API to run local Hermes.");
-  }
   const provider = localHermesProvider(config);
   const model = localHermesModel(config);
   if (provider) args.push("--provider", provider);
@@ -241,8 +368,14 @@ function normalizeLocalHermesOutput(value: unknown) {
 
 export async function createLocalResearchRun(input: CreateResearchRunInput): Promise<HermesRunResult> {
   const hermesRunId = `local_${randomUUID()}`;
+  const usageBefore = await captureLocalUsageSnapshot();
   const { stdout, stderr } = await runLocalHermesCli(buildLocalHermesPrompt(input));
   const rawCliOutput = stdout || stderr;
+  const [agentLogDelta, usageAfter] = await Promise.all([
+    readAgentLogDelta(usageBefore),
+    readJsonFile<SkillUsageSnapshot>(skillUsagePath(), {})
+  ]);
+  const resourceUsage = localResourceUsageFromLogs(input, rawCliOutput, agentLogDelta, usageBefore.skillUsage, usageAfter);
 
   try {
     const json = extractJsonObject(rawCliOutput);
@@ -255,7 +388,7 @@ export async function createLocalResearchRun(input: CreateResearchRunInput): Pro
       status: "completed",
       rawOutput: json,
       parsedOutput,
-      resourceUsage: localResourceUsage(input)
+      resourceUsage
     };
   } catch (error) {
     const parsedOutput = createMockHermesOutput(input);
@@ -271,7 +404,7 @@ export async function createLocalResearchRun(input: CreateResearchRunInput): Pro
         fallbackOutput: parsedOutput
       }, null, 2),
       parsedOutput,
-      resourceUsage: localResourceUsage(input)
+      resourceUsage
     };
   }
 }

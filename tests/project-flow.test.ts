@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
+  aggregatePrdReviewGate,
   getLatestCodexPackArtifacts,
   getLatestResearch,
+  isReviewerRole,
   isReportAssistantReady,
+  mergePrdReviewReviewer,
   normalizeInitialProjectPlanning,
+  normalizePrdReviewGate,
+  normalizeRoadmap,
   parseReportAssistantContext,
-  parseTechStackRecommendations
+  parseTechStackRecommendations,
+  renderPrdReviewMarkdown
 } from "@/lib/services/project-flow";
 import { createMockHermesOutput } from "@/lib/hermes/mock";
 
@@ -98,5 +104,123 @@ describe("project-flow helpers", () => {
       problemAndUsers: fallback.problemAndUsers,
       coreFeatures: fallback.coreFeatures
     });
+  });
+
+  it("aggregates PRD Review Gate only when all reviewers completed", () => {
+    const reviewers = ["Product", "UX", "Engineering", "QA", "Compliance", "Business"].map((role) => ({
+      role,
+      status: "completed",
+      verdict: "PASS",
+      summary: `${role} passed`,
+      findings: ["PRD is reviewable."],
+      requiredChanges: [],
+      suggestions: [],
+      riskLevel: "LOW",
+      confidence: 0.8
+    }));
+
+    const result = aggregatePrdReviewGate(reviewers as never);
+
+    expect(result.status).toBe("completed");
+    expect(result.gateDecision).toBe("PASS");
+  });
+
+  it("sets PRD Review Gate to BLOCK or WARN from completed reviewer verdicts", () => {
+    const base = ["Product", "UX", "Engineering", "QA", "Compliance", "Business"].map((role) => ({
+      role,
+      status: "completed",
+      verdict: "PASS",
+      summary: `${role} passed`,
+      findings: ["PRD is reviewable."],
+      requiredChanges: [],
+      suggestions: [],
+      riskLevel: "LOW",
+      confidence: 0.8
+    }));
+
+    expect(aggregatePrdReviewGate(base.map((item) => item.role === "QA" ? { ...item, verdict: "WARN" } : item) as never).gateDecision).toBe("WARN");
+    expect(aggregatePrdReviewGate(base.map((item) => item.role === "Compliance" ? { ...item, verdict: "BLOCK" } : item) as never).gateDecision).toBe("BLOCK");
+  });
+
+  it("does not aggregate PRD Review Gate when a reviewer is missing, failed, or invalid", () => {
+    const missing = normalizePrdReviewGate({
+      reviewers: [
+        { role: "Product", verdict: "PASS", summary: "ok", findings: ["ok"], requiredChanges: [], suggestions: [], riskLevel: "LOW", confidence: 0.8 }
+      ]
+    });
+    const invalid = normalizePrdReviewGate({
+      reviewers: ["Product", "UX", "Engineering", "QA", "Compliance", "Business"].map((role) => ({
+        role,
+        verdict: role === "UX" ? "MAYBE" : "PASS",
+        summary: "ok",
+        findings: role === "Engineering" ? [] : ["ok"],
+        requiredChanges: [],
+        suggestions: [],
+        riskLevel: "LOW",
+        confidence: role === "QA" ? undefined : 0.8
+      }))
+    });
+
+    expect(missing.status).toBe("incomplete");
+    expect(missing.gateDecision).toBeUndefined();
+    expect(missing.missingReviewers).toContain("UX");
+    expect(invalid.status).toBe("incomplete");
+    expect(invalid.gateDecision).toBeUndefined();
+    expect(invalid.failedReviewers).toEqual(expect.arrayContaining(["UX", "Engineering", "QA"]));
+  });
+
+  it("renders incomplete PRD Review Gate as not suitable for Codex handoff", () => {
+    const result = normalizePrdReviewGate({ reviewers: [] });
+
+    expect(renderPrdReviewMarkdown(result)).toContain("Gate 未完成，不能作为 Codex Pack 交接依据");
+  });
+
+  it("replaces only one PRD reviewer when regenerating a role", () => {
+    const existing = normalizePrdReviewGate({
+      reviewers: ["Product", "UX", "Engineering", "QA", "Compliance", "Business"].map((role) => ({
+        role,
+        verdict: "PASS",
+        summary: `${role} original`,
+        findings: ["ok"],
+        requiredChanges: [],
+        suggestions: [],
+        riskLevel: "LOW",
+        confidence: 0.8
+      }))
+    });
+
+    const merged = mergePrdReviewReviewer(existing, {
+      role: "UX",
+      status: "completed",
+      verdict: "BLOCK",
+      summary: "UX regenerated",
+      findings: ["主路径缺少错误状态。"],
+      requiredChanges: ["补充错误状态。"],
+      suggestions: [],
+      riskLevel: "HIGH",
+      confidence: 0.9
+    }, "fixed-time");
+
+    expect(merged.gateDecision).toBe("BLOCK");
+    expect(merged.generatedAt).toBe("fixed-time");
+    expect(merged.reviewers.find((reviewer) => reviewer.role === "UX")?.summary).toBe("UX regenerated");
+    expect(merged.reviewers.find((reviewer) => reviewer.role === "Product")?.summary).toBe("Product original");
+  });
+
+  it("accepts only declared PRD reviewer roles", () => {
+    expect(isReviewerRole("Product")).toBe(true);
+    expect(isReviewerRole("Security")).toBe(false);
+  });
+
+  it("normalizes Roadmap enum fields to valid values", () => {
+    const roadmap = normalizeRoadmap({
+      items: [
+        { title: "Build", stage: "bad", priority: "bad", type: "bad", acceptanceCriteria: "done" }
+      ]
+    }, { generatedAt: "now", items: [] });
+
+    expect(roadmap.items[0].stage).toBe("NOW");
+    expect(roadmap.items[0].priority).toBe("P0");
+    expect(roadmap.items[0].type).toBe("RESEARCH");
   });
 });
