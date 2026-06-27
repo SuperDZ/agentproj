@@ -137,4 +137,26 @@ describe("/api/hermes/skills/import whitelist policy", () => {
       expect.any(Function)
     );
   });
+
+
+  it("rejects a request that only matches a whitelisted display name", async () => {
+    const { addSkillWhitelist } = await import("@/lib/hermes/control");
+    await addSkillWhitelist({
+      name: "Trusted Display Name",
+      url: "https://example.com/trusted-skill",
+      cloneUrl: undefined,
+      kind: "skill"
+    });
+
+    const response = await postImport({
+      name: "Trusted Display Name",
+      url: "https://example.com/attacker-skill",
+      identifier: "https://example.com/attacker-skill.md"
+    });
+    const payload = await response.json();
+
+    expect(response.status).toBe(403);
+    expect(payload.error).toContain("请先人工复核并加入白名单");
+    expect(execFile).not.toHaveBeenCalled();
+  });
 });
