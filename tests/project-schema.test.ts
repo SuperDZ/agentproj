@@ -57,8 +57,8 @@ describe("project schema", () => {
       problemDiscovery: "Interviewers need to see reasoning before screens.",
       requirementDefinition: "Export PRD, prototype, PPT, and coding plan.",
       coreFeatures: "discovery, scope, pptx",
-      modelProvider: "codex-cli",
-      modelName: "codex-cli-default",
+      modelProvider: "openrouter",
+      modelName: "openai/gpt-4.1-mini",
       modelUsageMode: "codex-cli",
       codexCliCommand: "codex"
     });
@@ -66,7 +66,22 @@ describe("project schema", () => {
     expect(parsed.problemDiscovery).toContain("reasoning");
     expect(parsed.requirementDefinition).toContain("PRD");
     expect(parsed.coreFeatures).toBe("discovery, scope, pptx");
-    expect(parsed.modelConfig.provider).toBe("codex-cli");
-    expect(parsed.modelConfig.codexCliCommand).toBe("codex");
+    expect(parsed.modelConfig.provider).toBe("openrouter");
+    expect(parsed.modelConfig.usageMode).toBe("api");
+  });
+
+  it("uses the selected provider default model when model name is omitted", () => {
+    const parsed = createProjectSchema.parse({
+      idea: "Build a research workflow",
+      industry: "devtools",
+      targetUser: "PMs",
+      modelProvider: "qwen"
+    });
+
+    expect(parsed.modelConfig).toMatchObject({
+      provider: "qwen",
+      model: "qwen-plus",
+      usageMode: "api"
+    });
   });
 });

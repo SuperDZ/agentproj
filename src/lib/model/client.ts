@@ -1,10 +1,10 @@
 import { recordModelInvocation } from "@/lib/observability";
+import { defaultModelForProvider, isModelProvider } from "@/lib/model/providers";
 
 export type ModelConfig = {
   provider?: string;
   model?: string;
-  usageMode?: string;
-  codexCliCommand?: string | null;
+  usageMode?: "api";
 };
 
 type ChatMessage = { role: "system" | "user"; content: string };
@@ -12,19 +12,25 @@ type ChatMessage = { role: "system" | "user"; content: string };
 function endpointFor(provider: string) {
   if (provider === "qwen") return process.env.DASHSCOPE_BASE_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
   if (provider === "openai") return process.env.OPENAI_BASE_URL || "https://api.openai.com/v1/chat/completions";
+  if (provider === "moonshot") return process.env.MOONSHOT_BASE_URL || "https://api.moonshot.cn/v1/chat/completions";
+  if (provider === "zhipu") return process.env.ZHIPU_BASE_URL || "https://open.bigmodel.cn/api/paas/v4/chat/completions";
+  if (provider === "siliconflow") return process.env.SILICONFLOW_BASE_URL || "https://api.siliconflow.cn/v1/chat/completions";
+  if (provider === "openrouter") return process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1/chat/completions";
+  if (provider === "volcengine") return process.env.VOLCENGINE_BASE_URL || "https://ark.cn-beijing.volces.com/api/v3/chat/completions";
+  if (provider === "custom") return process.env.CUSTOM_OPENAI_BASE_URL || process.env.OPENAI_COMPATIBLE_BASE_URL || "http://localhost:11434/v1/chat/completions";
   return process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com/chat/completions";
 }
 
 function keyFor(provider: string) {
   if (provider === "qwen") return process.env.DASHSCOPE_API_KEY;
   if (provider === "openai") return process.env.OPENAI_API_KEY;
+  if (provider === "moonshot") return process.env.MOONSHOT_API_KEY;
+  if (provider === "zhipu") return process.env.ZHIPU_API_KEY;
+  if (provider === "siliconflow") return process.env.SILICONFLOW_API_KEY;
+  if (provider === "openrouter") return process.env.OPENROUTER_API_KEY;
+  if (provider === "volcengine") return process.env.VOLCENGINE_API_KEY;
+  if (provider === "custom") return process.env.CUSTOM_OPENAI_API_KEY || process.env.OPENAI_COMPATIBLE_API_KEY;
   return process.env.DEEPSEEK_API_KEY;
-}
-
-function defaultModel(provider: string) {
-  if (provider === "qwen") return "qwen-plus";
-  if (provider === "openai") return "gpt-4.1-mini";
-  return "deepseek-chat";
 }
 
 function extractJson(text: string) {
@@ -51,10 +57,9 @@ export async function generateJsonWithModel<T>({
   projectId?: string;
   traceId?: string;
 }): Promise<T> {
-  if (config?.usageMode === "codex-cli") return fallback;
-
-  const provider = (config?.provider || process.env.HERMES_INFERENCE_PROVIDER || "deepseek").toLowerCase();
-  const model = config?.model || process.env.HERMES_INFERENCE_MODEL || defaultModel(provider);
+  const configuredProvider = (config?.provider || process.env.HERMES_INFERENCE_PROVIDER || "deepseek").toLowerCase();
+  const provider = isModelProvider(configuredProvider) ? configuredProvider : "deepseek";
+  const model = config?.model || process.env.HERMES_INFERENCE_MODEL || defaultModelForProvider(provider);
   const startedAt = Date.now();
   const apiKey = keyFor(provider);
   if (!apiKey) {

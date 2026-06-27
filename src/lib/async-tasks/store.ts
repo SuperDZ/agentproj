@@ -234,6 +234,7 @@ export async function completeTask(task: AsyncTask, result?: unknown) {
       resultJson: result ? taskPayload(result) : task.resultJson,
       lockedBy: null,
       lockExpiresAt: null,
+      lastError: null,
       completedAt: new Date()
     }
   });

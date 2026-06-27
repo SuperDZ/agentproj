@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { handleApiError } from "@/lib/api/errors";
 import { cacheDelete, cacheGetJson, cacheSetJson } from "@/lib/cache/redis";
 import { prisma } from "@/lib/db/prisma";
+import { ensureLocalHermesDashboardRunning } from "@/lib/hermes/control";
 import { createProjectSchema, projectNameFromIdea } from "@/lib/project-schema";
 import { createProjectSkillToolRecommendations, generateInitialProjectPlanningWithHermes } from "@/lib/services/project-flow";
 
@@ -20,6 +21,7 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const input = createProjectSchema.parse(await request.json());
+    await ensureLocalHermesDashboardRunning();
     const project = await prisma.project.create({
       data: {
         name: input.name || projectNameFromIdea(input.idea),

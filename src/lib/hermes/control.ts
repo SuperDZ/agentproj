@@ -11,6 +11,7 @@ import type {
   SkillSearchSafety,
   SkillWhitelistEntry
 } from "@/lib/skills/skill-types";
+import { defaultModelForProvider, isModelProvider } from "@/lib/model/providers";
 
 const stateDir = path.join(process.cwd(), ".next", "hermes");
 const pidFile = path.join(stateDir, "dashboard.pid");
@@ -20,8 +21,7 @@ const inventoryCacheDir = path.join(process.cwd(), ".cache", "hermes", "skills-i
 export type HermesModelConfig = {
   provider: string;
   model: string;
-  usageMode: "api" | "codex-cli";
-  codexCliCommand: string;
+  usageMode: "api";
 };
 
 const officialReviewedSkillRepos = new Set(["NousResearch/hermes-agent", "Hermes bundled skills"]);
@@ -175,17 +175,14 @@ function stringValue(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function normalizeUsageMode(value: unknown): HermesModelConfig["usageMode"] {
-  return value === "codex-cli" ? "codex-cli" : "api";
-}
-
 export async function readModelConfig(): Promise<HermesModelConfig> {
   const savedModelConfig = await readJsonFile<Record<string, unknown>>(modelConfigFile, {});
+  const rawProvider = stringValue(savedModelConfig.provider).toLowerCase();
+  const provider = isModelProvider(rawProvider) ? rawProvider : "";
   return {
-    provider: stringValue(savedModelConfig.provider),
+    provider,
     model: stringValue(savedModelConfig.model),
-    usageMode: normalizeUsageMode(savedModelConfig.usageMode),
-    codexCliCommand: stringValue(savedModelConfig.codexCliCommand) || "codex"
+    usageMode: "api"
   };
 }
 
@@ -205,21 +202,21 @@ export async function getHermesStatus() {
     localRoot: hermesRoot(),
     ...pythonDiagnostics,
     provider: savedModelConfig.provider || process.env.HERMES_LOCAL_PROVIDER || process.env.HERMES_INFERENCE_PROVIDER || "",
-    model: savedModelConfig.model || process.env.HERMES_LOCAL_MODEL || process.env.HERMES_INFERENCE_MODEL || "",
+    model: savedModelConfig.model || process.env.HERMES_LOCAL_MODEL || process.env.HERMES_INFERENCE_MODEL || defaultModelForProvider(savedModelConfig.provider || "deepseek"),
     usageMode: savedModelConfig.usageMode,
-    codexCliCommand: savedModelConfig.codexCliCommand,
     dashboardPid,
     dashboardPids,
     dashboardPidSource: recordedDashboardPid ? "pid-file" : dashboardPid ? "process-scan" : "none"
   };
 }
 
-export async function saveModelConfig(config: { provider: string; model: string; usageMode: string; codexCliCommand?: string }) {
+export async function saveModelConfig(config: { provider: string; model: string }) {
+  const rawProvider = stringValue(config.provider).toLowerCase();
+  const provider = isModelProvider(rawProvider) ? rawProvider : "deepseek";
   const normalized = {
-    provider: stringValue(config.provider),
-    model: stringValue(config.model),
-    usageMode: normalizeUsageMode(config.usageMode),
-    codexCliCommand: stringValue(config.codexCliCommand) || "codex"
+    provider,
+    model: stringValue(config.model) || defaultModelForProvider(provider),
+    usageMode: "api" as const
   };
   await writeJsonFile(modelConfigFile, normalized);
   return normalized;
@@ -356,6 +353,23 @@ export async function stopHermesDashboard() {
 export async function restartHermesDashboard() {
   await stopHermesDashboard();
   return startHermesDashboard();
+}
+
+export async function ensureLocalHermesDashboardRunning() {
+  if (process.env.HERMES_MODE !== "local") {
+    return { mode: process.env.HERMES_MODE || "real", checked: false, started: false };
+  }
+
+  const currentStatus = await getHermesStatus();
+  if (currentStatus.dashboardPid) {
+    return { mode: "local", checked: true, started: false, status: currentStatus };
+  }
+
+  const startedStatus = await startHermesDashboard();
+  if (!startedStatus.dashboardPid) {
+    throw new Error("Hermes local mode requires a running dashboard, but automatic startup did not produce a valid dashboard process.");
+  }
+  return { mode: "local", checked: true, started: true, status: startedStatus };
 }
 
 export async function readSkillWhitelist(): Promise<SkillWhitelistEntry[]> {

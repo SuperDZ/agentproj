@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowLeft, Boxes, CheckCircle2, ClipboardList, Code2, FileText, FlaskConical, Layers3, ScrollText, ShieldCheck, Sparkles } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Boxes, CheckCircle2, ClipboardList, Code2, FileText, FlaskConical, GitBranch, Layers3, ScrollText, ShieldCheck, Sparkles } from "lucide-react";
 import { CodexPackActions } from "@/components/codex-pack-actions";
 import { HermesControlPanel } from "@/components/hermes-control-panel";
 import { ResearchRunStatus } from "@/components/research-run-status";
@@ -9,7 +9,8 @@ import { Badge, Card, Progress, buttonStyles, fieldStyles } from "@/components/u
 import { WorkflowActionButton } from "@/components/workflow-action-button";
 import { evaluateCurrentProject, exportCodexPack, savePrd, saveReportAssistantWithStatus, selectTechStack } from "@/app/actions";
 import { prisma } from "@/lib/db/prisma";
-import { evaluateProjectFlow, getLatestCodexPackArtifacts, getLatestPrd, getLatestResearch, isReportAssistantReady, parseReportAssistantContext, parseTechStackRecommendations } from "@/lib/services/project-flow";
+import { evidencePdrsDimensionNames, evaluateProjectFlow, getLatestCodexPackArtifacts, getLatestPrd, getLatestResearch, isReportAssistantReady, parseLatestEvidencePdrs, parseLatestPrdReviewGate, parseLatestRoadmap, parseReportAssistantContext, parseTechStackRecommendations } from "@/lib/services/project-flow";
+import type { EvidencePdrsDimensionName, PdrsRecommendation, PrdReviewGateResult, ReviewVerdict, ReviewerStatus, RoadmapPriority } from "@/lib/services/project-flow";
 import { recommendedSkillSources } from "@/lib/skills/recommended-skills";
 import { skillSafetyPolicy } from "@/lib/skills/skill-policy";
 
@@ -24,6 +25,8 @@ const workflowSteps = [
   { label: "PRD", id: "prd", icon: FileText },
   { label: "技术栈", id: "tech-stack", icon: Boxes },
   { label: "PDRS", id: "pdrs", icon: CheckCircle2 },
+  { label: "PRD Gate", id: "prd-review-gate", icon: ShieldCheck },
+  { label: "Roadmap", id: "roadmap", icon: GitBranch },
   { label: "Agent Review", id: "agent-review", icon: ShieldCheck },
   { label: "Codex Pack", id: "codex-pack", icon: Code2 },
   { label: "原型", id: "prototype", icon: Sparkles }
@@ -52,6 +55,9 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
   const prd = getLatestPrd(project);
   const { evaluation } = evaluateProjectFlow(project);
   const latestEvaluation = project.evaluations[0];
+  const evidencePdrs = parseLatestEvidencePdrs(project);
+  const roadmap = parseLatestRoadmap(project);
+  const prdReviewGate = parseLatestPrdReviewGate(project);
   const codexArtifacts = getLatestCodexPackArtifacts(project);
   const techStacks = parseTechStackRecommendations(project);
   const selectedStack = artifact(project, "selected_tech_stack");
@@ -64,6 +70,7 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
   const currentScore = latestEvaluation?.pdrs ?? evaluation.pdrs;
   const latestAgentReview = agentReviewState.reviews[0];
   const codexBlocked = agentReviewState.latestCodexReview?.decision === "blocked";
+  const codexGateWarning = prdReviewGate && (prdReviewGate.status === "incomplete" || prdReviewGate.gateDecision === "WARN" || prdReviewGate.gateDecision === "BLOCK");
 
   return (
     <main className="min-h-screen">
@@ -233,14 +240,129 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
 
           <Card id="pdrs">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <SectionTitle title="PDRS" subtitle="综合 PRD、差异化判断、竞品矩阵和 Hermes 调研结果生成产品决策评分。" />
-              <form action={evaluateAction}><button className={buttonStyles.primary}>运行评估</button></form>
+              <SectionTitle title="Evidence PDRS" subtitle="用分数、证据、置信度、风险和缺失证据解释产品决策。" />
+              <div className="flex flex-wrap gap-2">
+                <form action={evaluateAction}><button className={buttonStyles.secondary}>运行传统评估</button></form>
+                <WorkflowActionButton label="生成 Evidence PDRS" endpoint={`/api/projects/${project.id}/evidence-pdrs`} stages={["读取项目上下文", "校验证据来源", "生成证据化评分", "写入 Markdown artifact"]} className={buttonStyles.primary} />
+              </div>
             </div>
             <div className="mt-4 grid gap-4 lg:grid-cols-2">
               <Score label="当前估算" value={evaluation.pdrs} />
               <Score label="最近保存分数" value={latestEvaluation?.pdrs ?? evaluation.pdrs} />
               <div className="lg:col-span-2"><Progress value={currentScore} /></div>
             </div>
+            {evidencePdrs ? (
+              <div className="mt-5 grid gap-4">
+                <div className="rounded-lg border border-stone-200 bg-white/80 p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-bold text-stone-950">证据化建议</p>
+                      <p className="mt-1 text-xs text-stone-500">Overall Score：{evidencePdrs.overallScore}</p>
+                    </div>
+                    <Badge tone={recommendationTone(evidencePdrs.finalRecommendation)}>{evidencePdrs.finalRecommendation}</Badge>
+                  </div>
+                </div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  {evidencePdrsDimensionNames.map((name) => {
+                    const dimension = evidencePdrs.dimensions[name];
+                    return (
+                      <details key={name} className="rounded-lg border border-stone-200 bg-white/75 p-4">
+                        <summary className="cursor-pointer text-sm font-bold text-stone-950">
+                          {dimensionLabel(name)} · {dimension.score}
+                        </summary>
+                        <p className="mt-3 text-sm leading-6 text-stone-600">{dimension.reason}</p>
+                        <p className="mt-2 text-xs font-semibold text-stone-500">置信度：{Math.round(dimension.confidence * 100)}%</p>
+                        <EvidenceList title="Evidence" items={dimension.evidence} />
+                        <EvidenceList title="Risks" items={dimension.risks} />
+                        <EvidenceList title="Missing Evidence" items={dimension.missingEvidence} />
+                      </details>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : <p className="mt-4 rounded-lg bg-stone-100 p-4 text-sm text-stone-500">尚未生成 Evidence PDRS。</p>}
+          </Card>
+
+          <Card id="prd-review-gate">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <SectionTitle title="PRD Review Gate" subtitle="Product、UX、Engineering、QA、Compliance、Business 六角色全部正常完成后才聚合结论。" />
+              <WorkflowActionButton label="运行 PRD Review Gate" endpoint={`/api/projects/${project.id}/prd-review`} stages={["生成六角色审查", "校验角色输出", "聚合 gate decision", "写入 PRD_REVIEW.md"]} disabled={!prd} disabledReason="请先生成或保存 PRD。" className={buttonStyles.primary} />
+            </div>
+            {prdReviewGate ? (
+              <div className="mt-4 grid gap-4">
+                <div className={prdReviewGate.status === "completed" ? "rounded-lg border border-emerald-200 bg-emerald-50 p-4" : "rounded-lg border border-amber-200 bg-amber-50 p-4"}>
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-bold text-stone-950">Gate 状态：{prdReviewGate.status}</p>
+                      <p className="mt-1 text-xs leading-5 text-stone-600">
+                        {prdReviewGate.gateDecision ? `聚合结论：${prdReviewGate.gateDecision}` : "审查未完成，未生成最终 gate decision。"}
+                      </p>
+                    </div>
+                    <Badge tone={gateTone(prdReviewGate)}>{prdReviewGate.gateDecision ?? "INCOMPLETE"}</Badge>
+                  </div>
+                  {prdReviewGate.status === "incomplete" ? (
+                    <p className="mt-3 flex items-start gap-2 text-sm leading-6 text-amber-900">
+                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                      Gate 未完成，不能作为 Codex Pack 交接依据。缺失角色：{prdReviewGate.missingReviewers.join("、") || "无"}；失败/非法角色：{prdReviewGate.failedReviewers.join("、") || "无"}。
+                    </p>
+                  ) : null}
+                </div>
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  {prdReviewGate.reviewers.map((reviewer) => (
+                    <div key={reviewer.role} className="rounded-lg border border-stone-200 bg-white/80 p-4">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <p className="truncate text-sm font-bold text-stone-950">{reviewer.role}</p>
+                          <WorkflowActionButton
+                            label="重新生成"
+                            endpoint={`/api/projects/${project.id}/prd-review/reviewers/${encodeURIComponent(reviewer.role)}`}
+                            stages={[`重跑 ${reviewer.role}`, "短重试失败输出", "重新聚合 Gate", "写入 PRD_REVIEW.md"]}
+                            disabled={!prd}
+                            disabledReason="请先生成或保存 PRD。"
+                            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-600 shadow-sm transition hover:border-brand-500/50 hover:bg-brand-50 hover:text-brand-700 focus:outline-none focus:ring-2 focus:ring-brand-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+                            iconOnly
+                          />
+                        </div>
+                        <Badge tone={reviewerTone(reviewer.status, reviewer.verdict)}>{reviewer.verdict ?? reviewer.status}</Badge>
+                      </div>
+                      <p className="mt-2 text-xs leading-5 text-stone-600">{reviewer.summary}</p>
+                      <EvidenceList title="Findings" items={reviewer.findings} />
+                      <EvidenceList title="Required Changes" items={reviewer.requiredChanges} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : <p className="mt-4 rounded-lg bg-stone-100 p-4 text-sm text-stone-500">尚未运行 PRD Review Gate。</p>}
+          </Card>
+
+          <Card id="roadmap">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <SectionTitle title="Roadmap Builder" subtitle="基于项目上下文、PRD、Hermes 调研和 Evidence PDRS 生成 NOW/NEXT/LATER 路线图。" />
+              <WorkflowActionButton label="生成 Roadmap" endpoint={`/api/projects/${project.id}/roadmap`} stages={["读取 PRD 与证据", "识别依赖和风险", "分组 NOW/NEXT/LATER", "写入 ROADMAP.md"]} className={buttonStyles.primary} />
+            </div>
+            {roadmap ? (
+              <div className="mt-4 grid gap-4 xl:grid-cols-3">
+                {(["NOW", "NEXT", "LATER"] as const).map((stage) => (
+                  <div key={stage} className="rounded-lg border border-stone-200 bg-white/75 p-4">
+                    <p className="text-xs font-bold uppercase text-stone-500">{stage}</p>
+                    <div className="mt-3 grid gap-3">
+                      {roadmap.items.filter((item) => item.stage === stage).map((item) => (
+                        <div key={`${stage}-${item.title}`} className="rounded-md border border-stone-200 bg-stone-50 p-3">
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-sm font-bold text-stone-950">{item.title}</p>
+                            <Badge tone={priorityTone(item.priority)}>{item.priority}</Badge>
+                          </div>
+                          <p className="mt-2 text-xs leading-5 text-stone-600">{item.description}</p>
+                          <p className="mt-2 text-xs text-stone-500">{item.type} · {item.estimatedEffort}</p>
+                          <EvidenceList title="验收标准" items={item.acceptanceCriteria} />
+                        </div>
+                      ))}
+                      {roadmap.items.filter((item) => item.stage === stage).length === 0 ? <p className="text-sm text-stone-500">暂无事项。</p> : null}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="mt-4 rounded-lg bg-stone-100 p-4 text-sm text-stone-500">尚未生成 Roadmap。</p>}
           </Card>
 
           <Card id="agent-review">
@@ -290,6 +412,11 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
               <form action={exportAction}><button disabled={codexBlocked} className={buttonStyles.primary}>导出 Codex Pack</button></form>
             </div>
             {codexBlocked ? <p className="mt-4 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800">Agent Review 当前结论为 blocked，已阻止 Codex Pack 导出。请处理高风险 finding 后重跑审查。</p> : null}
+            {codexGateWarning ? (
+              <p className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm leading-6 text-amber-900">
+                PRD Review Gate 当前为 {prdReviewGate.status === "incomplete" ? "incomplete" : prdReviewGate.gateDecision}。系统不阻断导出，但该 Codex Pack 不应被视为无风险交接包。
+              </p>
+            ) : null}
             <div className="mt-4 grid gap-3">
               {codexArtifacts.length > 0 ? (
                 <>
@@ -342,6 +469,63 @@ function Score({ label, value }: { label: string; value: number }) {
       <div className="mt-3"><Progress value={value} /></div>
     </div>
   );
+}
+
+function EvidenceList({ title, items }: { title: string; items: string[] }) {
+  return (
+    <div className="mt-3">
+      <p className="text-[11px] font-bold uppercase text-stone-500">{title}</p>
+      {items.length ? (
+        <ul className="mt-1 grid gap-1 text-xs leading-5 text-stone-600">
+          {items.slice(0, 4).map((item) => <li key={item}>- {item}</li>)}
+        </ul>
+      ) : <p className="mt-1 text-xs text-stone-400">暂无</p>}
+    </div>
+  );
+}
+
+function dimensionLabel(name: EvidencePdrsDimensionName) {
+  const labels: Record<EvidencePdrsDimensionName, string> = {
+    problemClarity: "问题清晰度",
+    userValue: "用户价值",
+    marketGap: "市场缺口",
+    differentiation: "差异化",
+    feasibility: "可行性",
+    deliveryComplexity: "交付复杂度",
+    businessImpact: "业务影响",
+    evidenceStrength: "证据强度",
+    complianceRisk: "合规风险",
+    overallScore: "总体分"
+  };
+  return labels[name];
+}
+
+function recommendationTone(value: PdrsRecommendation): "green" | "yellow" | "red" | "blue" | "slate" {
+  if (value === "GO") return "green";
+  if (value === "HOLD") return "blue";
+  if (value === "PIVOT") return "yellow";
+  return "red";
+}
+
+function priorityTone(value: RoadmapPriority): "green" | "yellow" | "red" | "blue" | "slate" {
+  if (value === "P0") return "red";
+  if (value === "P1") return "yellow";
+  if (value === "P2") return "blue";
+  return "slate";
+}
+
+function gateTone(result: PrdReviewGateResult): "green" | "yellow" | "red" | "blue" | "slate" {
+  if (result.status === "incomplete") return "yellow";
+  if (result.gateDecision === "PASS") return "green";
+  if (result.gateDecision === "BLOCK") return "red";
+  return "yellow";
+}
+
+function reviewerTone(status: ReviewerStatus, verdict?: ReviewVerdict): "green" | "yellow" | "red" | "blue" | "slate" {
+  if (status !== "completed") return status === "failed" || status === "invalid" ? "red" : "yellow";
+  if (verdict === "PASS") return "green";
+  if (verdict === "BLOCK") return "red";
+  return "yellow";
 }
 
 function artifact(project: { artifacts: Array<{ artifactType: string; content: string }> }, type: string) {

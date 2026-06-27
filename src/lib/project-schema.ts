@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { defaultModelForProvider, modelProviderValues } from "@/lib/model/providers";
 
 export const booleanLike = z
   .union([z.boolean(), z.enum(["true", "false"]), z.literal("on")])
@@ -14,10 +15,9 @@ export const monitorTaskConfigSchema = z.object({
 });
 
 export const modelConfigSchema = z.object({
-  provider: z.enum(["deepseek", "qwen", "openai", "codex-cli", "custom"]).default("deepseek"),
+  provider: z.enum(modelProviderValues).default("deepseek"),
   model: z.string().trim().min(1).default("deepseek-chat"),
-  usageMode: z.enum(["api", "codex-cli"]).default("api"),
-  codexCliCommand: z.string().trim().optional().nullable()
+  usageMode: z.literal("api").default("api")
 });
 
 function parseMonitorTaskConfigs(value: unknown) {
@@ -45,10 +45,8 @@ export const createProjectSchema = z
     problemDiscovery: z.string().trim().optional().nullable(),
     requirementDefinition: z.string().trim().optional().nullable(),
     coreFeatures: z.string().trim().optional().nullable(),
-    modelProvider: z.enum(["deepseek", "qwen", "openai", "codex-cli", "custom"]).default("deepseek"),
-    modelName: z.string().trim().optional().nullable(),
-    modelUsageMode: z.enum(["api", "codex-cli"]).default("api"),
-    codexCliCommand: z.string().trim().optional().nullable()
+    modelProvider: z.enum(modelProviderValues).default("deepseek"),
+    modelName: z.string().trim().optional().nullable()
   })
   .transform((input) => ({
     ...input,
@@ -56,9 +54,8 @@ export const createProjectSchema = z
     preferredTechStack: input.preferredTechStack || null,
     modelConfig: modelConfigSchema.parse({
       provider: input.modelProvider,
-      model: input.modelName || "deepseek-chat",
-      usageMode: input.modelUsageMode,
-      codexCliCommand: input.codexCliCommand
+      model: input.modelName || defaultModelForProvider(input.modelProvider),
+      usageMode: "api"
     })
   }));
 
