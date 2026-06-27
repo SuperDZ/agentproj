@@ -5,22 +5,32 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let tempRoot = "";
 let previousRoot: string | undefined;
+let previousCacheTtl: string | undefined;
+let previousTimeout: string | undefined;
 
 beforeEach(async () => {
+  vi.resetModules();
   previousRoot = process.env.HERMES_LOCAL_ROOT;
+  previousCacheTtl = process.env.HERMES_GITHUB_SEARCH_CACHE_TTL_MS;
+  previousTimeout = process.env.HERMES_GITHUB_SEARCH_TIMEOUT_MS;
   tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-skills-"));
   process.env.HERMES_LOCAL_ROOT = tempRoot;
+  process.env.HERMES_GITHUB_SEARCH_CACHE_TTL_MS = "60000";
+  process.env.HERMES_GITHUB_SEARCH_TIMEOUT_MS = "50";
 });
 
 afterEach(async () => {
   vi.unstubAllGlobals();
   process.env.HERMES_LOCAL_ROOT = previousRoot;
+  process.env.HERMES_GITHUB_SEARCH_CACHE_TTL_MS = previousCacheTtl;
+  process.env.HERMES_GITHUB_SEARCH_TIMEOUT_MS = previousTimeout;
   if (tempRoot) await fs.rm(tempRoot, { recursive: true, force: true });
 });
 
 function stubGithubSearch() {
   vi.stubGlobal("fetch", vi.fn(async () => ({
     ok: true,
+    headers: new Headers(),
     json: async () => ({
       items: [
         {
@@ -87,5 +97,39 @@ describe("Hermes skills search safety policy", () => {
     expect(results[0].whitelisted).toBe(true);
     expect(results[0].safety.status).toBe("passed");
     await expect(fs.access(path.join(tempRoot, "skills", "safety-whitelist.json"))).resolves.toBeUndefined();
+  });
+
+  it("uses cached GitHub search results within the configured TTL", async () => {
+    stubGithubSearch();
+    const { searchGithubSkills } = await import("@/lib/hermes/control");
+
+    await searchGithubSkills("agent skills");
+    await searchGithubSkills("agent skills");
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a clear rate limit error when GitHub search is exhausted", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: false,
+      status: 403,
+      headers: new Headers({
+        "x-ratelimit-remaining": "0",
+        "x-ratelimit-reset": "1767225600"
+      })
+    })));
+    const { searchGithubSkills } = await import("@/lib/hermes/control");
+
+    await expect(searchGithubSkills("agent skills")).rejects.toThrow("GitHub search rate limit exceeded");
+  });
+
+  it("times out slow GitHub search requests", async () => {
+    vi.stubGlobal("fetch", vi.fn((_url, init) => new Promise((_resolve, reject) => {
+      const signal = (init as RequestInit).signal;
+      signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+    })));
+    const { searchGithubSkills } = await import("@/lib/hermes/control");
+
+    await expect(searchGithubSkills("agent skills")).rejects.toThrow("GitHub search timed out after 50ms");
   });
 });
