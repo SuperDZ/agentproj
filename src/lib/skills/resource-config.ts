@@ -27,7 +27,7 @@ export type HermesResourceUsageItem = {
   name: string;
   path?: string;
   purpose?: string[];
-  callCount: number;
+  callCount?: number;
   status: "used" | "planned" | "not_reported";
   reason?: string;
 };

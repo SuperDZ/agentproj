@@ -78,4 +78,32 @@ describe("Codex Pack generator", () => {
     expect(prd).toContain("Hermes 前一轮调研");
     expect(prd).toContain("不能伪造竞品内部 PRD");
   });
+
+  it("includes optional Evidence PDRS, Roadmap, and PRD Review artifacts in the pack", () => {
+    const project = {
+      name: "SpecFlow",
+      idea: "Build a decision gate",
+      industry: "devtools",
+      targetUser: "PMs",
+      supplementalArtifacts: [
+        { filename: "EVIDENCE_PDRS.md", content: "# Evidence-based PDRS" },
+        { filename: "ROADMAP.md", content: "# Roadmap" },
+        { filename: "PRD_REVIEW.md", content: "# PRD Review Gate\n\n> Gate 未完成，不能作为 Codex Pack 交接依据。" }
+      ]
+    };
+    const research = createMockHermesOutput({ projectId: "p1", ...project });
+    const evaluation = evaluateProject({
+      idea: project.idea,
+      industry: project.industry,
+      targetUser: project.targetUser,
+      competitors: research.competitors.map((c) => ({ threatLevel: c.threat_level, reuseStrategy: c.reuse_strategy })),
+      differentiationScore: research.differentiation.differentiation_score,
+      prdMarkdown: "Product Goal Target Users Core Pain Points User Stories Acceptance Criteria Data Models API Contracts Non-goals"
+    });
+
+    const files = generateCodexPack(project, research, evaluation);
+
+    expect(files.map((file) => file.filename)).toEqual(expect.arrayContaining(["EVIDENCE_PDRS.md", "ROADMAP.md", "PRD_REVIEW.md"]));
+    expect(files.find((file) => file.filename === "PRD_REVIEW.md")?.content).toContain("Gate 未完成，不能作为 Codex Pack 交接依据");
+  });
 });

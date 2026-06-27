@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AsyncTask } from "@prisma/client";
 import { redisDecrement, redisSetNumber } from "@/lib/cache/redis";
-import { asyncTaskLeaseMs, completeTask, enqueueTask, failTask, parseTaskPayload, renewTaskLease } from "@/lib/async-tasks/store";
+import { asyncTaskLeaseMs, claimTask, completeTask, enqueueTask, failTask, parseTaskPayload, renewTaskLease } from "@/lib/async-tasks/store";
 import { prisma } from "@/lib/db/prisma";
 import { logEvent } from "@/lib/observability";
 import { buildAgentReviewSnapshot, storeAgentReviewSnapshot } from "@/lib/agents/context-snapshot";
@@ -121,6 +121,27 @@ export async function listAgentReviews(projectId: string) {
       consensuses: { orderBy: { createdAt: "desc" }, take: 1 }
     }
   });
+}
+
+export async function processInitialAgentReviewDispatch(reviewId: string) {
+  const review = await prisma.agentReview.findUniqueOrThrow({
+    where: { id: reviewId },
+    select: { id: true, projectId: true }
+  });
+  const task = await prisma.asyncTask.findFirst({
+    where: {
+      projectId: review.projectId,
+      type: agentReviewParallelTaskType,
+      status: { in: ["queued", "waiting"] },
+      payloadJson: { contains: review.id }
+    },
+    orderBy: [{ createdAt: "desc" }]
+  });
+  if (!task) return { processed: false, action: "idle" as const, reviewId: review.id };
+
+  const claimed = await claimTask(task.id);
+  if (!claimed) return { processed: false, action: "idle" as const, reviewId: review.id, taskId: task.id };
+  return processAgentReviewTask(claimed);
 }
 
 export async function getAgentReview(projectId: string, reviewId: string) {

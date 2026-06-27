@@ -20,6 +20,7 @@ import { acquireIdempotencyKey, cacheDelete, waitForTaskNotification } from "@/l
 import {
   asyncWorkerPollIntervalMs,
   asyncTaskLeaseMs,
+  activeTaskStatuses,
   claimTask,
   completeTask,
   enqueueTask,
@@ -52,6 +53,9 @@ export const codexPackArtifactTypes = [
   "PRD.md",
   "competitor_report.md",
   "evaluation_report.md",
+  "EVIDENCE_PDRS.md",
+  "ROADMAP.md",
+  "PRD_REVIEW.md",
   "api_spec.md",
   "tasks.md",
   "codex_prompt.md",
@@ -114,6 +118,113 @@ export type ResearchWorkerResult = {
 type ResearchTaskPayload = {
   researchRunId: string;
 };
+
+export const evidencePdrsArtifact = "evidence_pdrs";
+export const roadmapArtifact = "roadmap";
+export const prdReviewGateArtifact = "prd_review_gate";
+export const evidencePdrsMarkdownArtifact = "EVIDENCE_PDRS.md";
+export const roadmapMarkdownArtifact = "ROADMAP.md";
+export const prdReviewMarkdownArtifact = "PRD_REVIEW.md";
+
+export const evidencePdrsDimensionNames = [
+  "problemClarity",
+  "userValue",
+  "marketGap",
+  "differentiation",
+  "feasibility",
+  "deliveryComplexity",
+  "businessImpact",
+  "evidenceStrength",
+  "complianceRisk",
+  "overallScore"
+] as const;
+
+export type EvidencePdrsDimensionName = typeof evidencePdrsDimensionNames[number];
+export type PdrsRecommendation = "GO" | "HOLD" | "PIVOT" | "KILL";
+export type ReviewVerdict = "PASS" | "WARN" | "BLOCK";
+export type ReviewerRole = "Product" | "UX" | "Engineering" | "QA" | "Compliance" | "Business";
+export type ReviewerStatus = "completed" | "missing" | "invalid" | "failed";
+export type RoadmapStage = "NOW" | "NEXT" | "LATER";
+export type RoadmapPriority = "P0" | "P1" | "P2" | "P3";
+export type RoadmapItemType = "FEATURE" | "INFRA" | "RESEARCH" | "COMPLIANCE" | "UX" | "QA" | "OPS";
+
+export type EvidencePdrsDimension = {
+  score: number;
+  reason: string;
+  evidence: string[];
+  confidence: number;
+  risks: string[];
+  missingEvidence: string[];
+};
+
+export type EvidenceBasedPdrsResult = {
+  dimensions: Record<EvidencePdrsDimensionName, EvidencePdrsDimension>;
+  overallScore: number;
+  finalRecommendation: PdrsRecommendation;
+  generatedAt: string;
+};
+
+export type RoadmapItem = {
+  title: string;
+  description: string;
+  stage: RoadmapStage;
+  priority: RoadmapPriority;
+  type: RoadmapItemType;
+  rationale: string;
+  dependencies: string[];
+  risks: string[];
+  estimatedEffort: string;
+  successMetrics: string[];
+  acceptanceCriteria: string[];
+};
+
+export type RoadmapResult = {
+  generatedAt: string;
+  items: RoadmapItem[];
+};
+
+export type PrdReviewerResult = {
+  role: ReviewerRole;
+  status: ReviewerStatus;
+  verdict?: ReviewVerdict;
+  summary: string;
+  findings: string[];
+  requiredChanges: string[];
+  suggestions: string[];
+  riskLevel: "LOW" | "MEDIUM" | "HIGH";
+  confidence?: number;
+};
+
+export type PrdReviewGateResult = {
+  status: "completed" | "incomplete";
+  reviewerStatuses: Record<ReviewerRole, ReviewerStatus>;
+  reviewers: PrdReviewerResult[];
+  missingReviewers: ReviewerRole[];
+  failedReviewers: ReviewerRole[];
+  gateDecision?: ReviewVerdict;
+  generatedAt: string;
+};
+
+export const prdReviewerRoles: ReviewerRole[] = ["Product", "UX", "Engineering", "QA", "Compliance", "Business"];
+const prdReviewerMaxAttempts = 3;
+const prdReviewerRetryDelayMs = [450, 900];
+const prdReviewerRoleBriefs: Record<ReviewerRole, string> = {
+  Product: "审查用户问题、目标用户、价值主张、范围边界、MVP 优先级和验收标准是否足以驱动开发。",
+  UX: "审查用户路径、信息架构、交互负担、状态覆盖、错误反馈和可用性风险。",
+  Engineering: "审查技术可实现性、模块边界、数据模型、API 合约、异步任务、集成复杂度和维护风险。",
+  QA: "审查验收条件、测试边界、异常路径、回归风险、可测试性和发布前质量门槛。",
+  Compliance: "审查隐私、安全、权限、审计、金融适当性、数据处理和监管边界。",
+  Business: "审查商业目标、成本收益、上线节奏、市场风险、运营依赖和成功指标。"
+};
+
+export function isReviewerRole(value: string): value is ReviewerRole {
+  return prdReviewerRoles.includes(value as ReviewerRole);
+}
+
+function reviewerRoleFromString(value: string): ReviewerRole {
+  if (isReviewerRole(value)) return value;
+  throw new Error(`Unsupported PRD reviewer role: ${value}`);
+}
 
 function stringsFromUnknown(value: unknown): string[] {
   if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
@@ -222,10 +333,293 @@ function parseJson<T>(value: string | undefined, fallback: T): T {
   }
 }
 
+export function parseLatestEvidencePdrs(project: ProjectArtifacts): EvidenceBasedPdrsResult | undefined {
+  const raw = getArtifactContent(project, evidencePdrsArtifact);
+  if (!raw) return undefined;
+  const parsed = parseJson<unknown>(raw, undefined);
+  try {
+    return parsed ? normalizeEvidenceBasedPdrs(parsed, parsed as EvidenceBasedPdrsResult) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function parseLatestRoadmap(project: ProjectArtifacts): RoadmapResult | undefined {
+  const raw = getArtifactContent(project, roadmapArtifact);
+  if (!raw) return undefined;
+  const parsed = parseJson<unknown>(raw, undefined);
+  try {
+    return parsed ? normalizeRoadmap(parsed, parsed as RoadmapResult) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function parseLatestPrdReviewGate(project: ProjectArtifacts): PrdReviewGateResult | undefined {
+  const raw = getArtifactContent(project, prdReviewGateArtifact);
+  if (!raw) return undefined;
+  const parsed = parseJson<unknown>(raw, undefined);
+  try {
+    return parsed ? normalizePrdReviewGate(parsed) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function asStringArray(value: unknown): string[] {
   if (Array.isArray(value)) return value.map(String).map((item) => item.trim()).filter(Boolean);
   if (typeof value === "string") return value.split(/\r?\n|[,，、;]/).map((item) => item.trim()).filter(Boolean);
   return [];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function clampScore(value: unknown, fallback = 0) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(0, Math.min(100, Math.round(number)));
+}
+
+function clampConfidence(value: unknown, fallback = 0.25) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  if (number <= 1) return Math.max(0, Math.min(1, Number(number.toFixed(2))));
+  return Math.max(0, Math.min(1, Number((number / 100).toFixed(2))));
+}
+
+function enumValue<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+  const normalized = String(value || "").trim().toUpperCase();
+  return allowed.find((item) => item === normalized) ?? fallback;
+}
+
+function titleValue(value: unknown, fallback: string) {
+  const text = String(value || "").trim();
+  return text || fallback;
+}
+
+async function delay(ms: number) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeEvidenceDimension(value: unknown, fallback: EvidencePdrsDimension): EvidencePdrsDimension {
+  const record = isRecord(value) ? value : {};
+  return {
+    score: clampScore(record.score, fallback.score),
+    reason: titleValue(record.reason, fallback.reason),
+    evidence: asStringArray(record.evidence).length ? asStringArray(record.evidence) : fallback.evidence,
+    confidence: clampConfidence(record.confidence, fallback.confidence),
+    risks: asStringArray(record.risks).length ? asStringArray(record.risks) : fallback.risks,
+    missingEvidence: asStringArray(record.missingEvidence).length ? asStringArray(record.missingEvidence) : fallback.missingEvidence
+  };
+}
+
+function defaultEvidenceDimension(label: EvidencePdrsDimensionName, score: number, reason: string, evidence: string[], missingEvidence: string[] = []): EvidencePdrsDimension {
+  return {
+    score: clampScore(score),
+    reason,
+    evidence,
+    confidence: evidence.length > 1 && missingEvidence.length === 0 ? 0.65 : 0.35,
+    risks: missingEvidence.length ? ["证据不足时不能直接进入高置信度交付判断。"] : [],
+    missingEvidence: missingEvidence.length ? missingEvidence : [`${label} 仍需要更多外部验证。`]
+  };
+}
+
+export function fallbackEvidencePdrs(project: ProjectWithFlowData, evaluation: EvaluationResult, prd: string, research?: HermesResearchOutput): EvidenceBasedPdrsResult {
+  const reportContext = parseReportAssistantContext(project);
+  const competitorEvidence = project.competitors.map((item) => `${item.name} 威胁等级 ${item.threatLevel}`);
+  const researchEvidence = research ? ["Hermes 已返回竞品和差异化结构化结果。"] : [];
+  const prdEvidence = prd ? ["已存在 PRD，可用于规格完整度判断。"] : [];
+  const dimensions: Record<EvidencePdrsDimensionName, EvidencePdrsDimension> = {
+    problemClarity: defaultEvidenceDimension("problemClarity", evaluation.opportunityScore.score, evaluation.opportunityScore.reasons.join(" "), [project.idea, reportContext.problemAndUsers].filter(Boolean), reportContext.problemAndUsers ? [] : ["缺少已确认的问题与用户描述。"]),
+    userValue: defaultEvidenceDimension("userValue", reportContext.coreFeatures.length >= 3 ? 72 : 45, "以已确认核心功能和目标用户估算用户价值。", [project.targetUser, ...reportContext.coreFeatures], reportContext.coreFeatures.length >= 3 ? [] : ["缺少 3-5 个已确认核心功能。"]),
+    marketGap: defaultEvidenceDimension("marketGap", evaluation.competitiveScore.score, "根据竞品数量、威胁等级和差异化得分估算市场空隙。", competitorEvidence, competitorEvidence.length ? [] : ["缺少 Hermes 竞品矩阵。"]),
+    differentiation: defaultEvidenceDimension("differentiation", evaluation.differentiationScore, "根据 Hermes 差异化分数和 MVP 修改建议估算。", researchEvidence.concat(research?.differentiation.score_basis ?? []), research ? [] : ["缺少 Hermes 差异化证据。"]),
+    feasibility: defaultEvidenceDimension("feasibility", evaluation.specificationScore.score, "根据 PRD 中的数据模型、API 合约和验收标准估算。", prdEvidence, prd ? [] : ["缺少 PRD。"]),
+    deliveryComplexity: defaultEvidenceDimension("deliveryComplexity", 100 - evaluation.redundancyRisk, "交付复杂度以同质化风险和规格完整度反向估算。", [`同质化风险：${evaluation.redundancyRisk}`], ["缺少工程拆分、依赖图和团队容量信息。"]),
+    businessImpact: defaultEvidenceDimension("businessImpact", evaluation.opportunityScore.score, "根据命题、行业语境和目标用户估算业务影响。", [project.industry, project.targetUser, project.idea], ["缺少真实商业指标、定价或转化数据。"]),
+    evidenceStrength: defaultEvidenceDimension("evidenceStrength", Math.round((competitorEvidence.length ? 50 : 20) + (prd ? 20 : 0) + (research ? 20 : 0)), "统计 PRD、Hermes 研究和竞品证据覆盖度。", [...competitorEvidence, ...prdEvidence, ...researchEvidence], ["缺少用户访谈、真实使用数据或外部市场数据。"]),
+    complianceRisk: defaultEvidenceDimension("complianceRisk", project.needFinancialSuitabilityCheck ? 45 : 70, "根据金融适当性标记和 PRD 风险边界估算。", project.needFinancialSuitabilityCheck ? ["项目要求金融适当性检查。"] : ["未标记强金融适当性约束。"], project.needFinancialSuitabilityCheck ? ["缺少合规审查结论和禁用表述清单。"] : ["仍需人工确认是否涉及监管边界。"]),
+    overallScore: defaultEvidenceDimension("overallScore", evaluation.pdrs, "沿用当前 PDRS 作为保守总体分，并标注证据缺口。", [`当前 PDRS：${evaluation.pdrs}`], ["总体分仍需 Evidence PDRS 模型补充逐项证据。"])
+  };
+  const overallScore = dimensions.overallScore.score;
+  return {
+    dimensions,
+    overallScore,
+    finalRecommendation: overallScore >= 85 ? "GO" : overallScore >= 70 ? "HOLD" : overallScore >= 50 ? "PIVOT" : "KILL",
+    generatedAt: new Date().toISOString()
+  };
+}
+
+export function normalizeEvidenceBasedPdrs(value: unknown, fallback: EvidenceBasedPdrsResult): EvidenceBasedPdrsResult {
+  const record = isRecord(value) ? value : {};
+  const rawDimensions = isRecord(record.dimensions) ? record.dimensions : record;
+  const dimensions = evidencePdrsDimensionNames.reduce((acc, name) => {
+    acc[name] = normalizeEvidenceDimension(rawDimensions[name], fallback.dimensions[name]);
+    return acc;
+  }, {} as Record<EvidencePdrsDimensionName, EvidencePdrsDimension>);
+  const overallScore = clampScore(record.overallScore ?? dimensions.overallScore.score, fallback.overallScore);
+  dimensions.overallScore = { ...dimensions.overallScore, score: overallScore };
+  return {
+    dimensions,
+    overallScore,
+    finalRecommendation: enumValue(record.finalRecommendation, ["GO", "HOLD", "PIVOT", "KILL"] as const, fallback.finalRecommendation),
+    generatedAt: titleValue(record.generatedAt, fallback.generatedAt)
+  };
+}
+
+function normalizeRoadmapItem(value: unknown, index: number): RoadmapItem {
+  const record = isRecord(value) ? value : {};
+  return {
+    title: titleValue(record.title, `待验证路线图项 ${index + 1}`),
+    description: titleValue(record.description, "该事项需要在后续产品澄清后细化。"),
+    stage: enumValue(record.stage, ["NOW", "NEXT", "LATER"] as const, index === 0 ? "NOW" : index === 1 ? "NEXT" : "LATER"),
+    priority: enumValue(record.priority, ["P0", "P1", "P2", "P3"] as const, index === 0 ? "P0" : "P2"),
+    type: enumValue(record.type, ["FEATURE", "INFRA", "RESEARCH", "COMPLIANCE", "UX", "QA", "OPS"] as const, "RESEARCH"),
+    rationale: titleValue(record.rationale, "该事项来自当前 PRD、调研或证据缺口。"),
+    dependencies: asStringArray(record.dependencies),
+    risks: asStringArray(record.risks),
+    estimatedEffort: titleValue(record.estimatedEffort, "待估算"),
+    successMetrics: asStringArray(record.successMetrics),
+    acceptanceCriteria: asStringArray(record.acceptanceCriteria)
+  };
+}
+
+export function normalizeRoadmap(value: unknown, fallback: RoadmapResult): RoadmapResult {
+  const record = isRecord(value) ? value : {};
+  const rawItems = Array.isArray(record.items) ? record.items : Array.isArray(value) ? value : fallback.items;
+  const items = rawItems.map((item, index) => normalizeRoadmapItem(item, index)).filter((item) => item.title);
+  return {
+    generatedAt: titleValue(record.generatedAt, fallback.generatedAt),
+    items: items.length ? items : fallback.items
+  };
+}
+
+function fallbackRoadmap(project: ProjectWithFlowData, prd: string, pdrs?: EvidenceBasedPdrsResult): RoadmapResult {
+  const reportContext = parseReportAssistantContext(project);
+  const features = reportContext.coreFeatures.length ? reportContext.coreFeatures : ["确认问题与用户", "生成 PRD", "导出 Codex Pack"];
+  return {
+    generatedAt: new Date().toISOString(),
+    items: features.slice(0, 5).map((feature, index) => ({
+      title: feature,
+      description: `围绕「${feature}」完成最小可验证能力。`,
+      stage: index === 0 ? "NOW" : index === 1 ? "NEXT" : "LATER",
+      priority: index === 0 ? "P0" : index === 1 ? "P1" : "P2",
+      type: index === 0 ? "FEATURE" : "RESEARCH",
+      rationale: pdrs ? `Evidence PDRS 当前建议为 ${pdrs.finalRecommendation}，优先补齐高影响事项。` : "基于当前 PRD 与项目上下文生成保守路线图。",
+      dependencies: prd ? ["已生成 PRD"] : ["需要先生成 PRD"],
+      risks: ["证据不足时优先做验证，不直接扩大范围。"],
+      estimatedEffort: "1-2 天",
+      successMetrics: ["核心用户路径可演示", "验收标准可执行"],
+      acceptanceCriteria: ["页面或服务行为可复现", "失败状态有明确反馈"]
+    }))
+  };
+}
+
+function normalizeReviewer(role: ReviewerRole, value: unknown): PrdReviewerResult {
+  if (!isRecord(value)) {
+    return { role, status: "missing", summary: "未返回该角色审查结果。", findings: [], requiredChanges: [], suggestions: [], riskLevel: "HIGH" };
+  }
+  const rawStatus = String(value.status || "").toLowerCase();
+  if (rawStatus === "failed") {
+    return { role, status: "failed", summary: titleValue(value.summary || value.error, "该角色审查执行失败。"), findings: [], requiredChanges: [], suggestions: [], riskLevel: "HIGH" };
+  }
+  const rawVerdict = String(value.verdict || "").trim().toUpperCase();
+  const verdictAllowed = ["PASS", "WARN", "BLOCK"].includes(rawVerdict);
+  const verdict = enumValue(value.verdict, ["PASS", "WARN", "BLOCK"] as const, "WARN");
+  const confidenceNumber = Number(value.confidence);
+  const findings = asStringArray(value.findings);
+  const hasValidConfidence = Number.isFinite(confidenceNumber);
+  const valid = verdictAllowed && hasValidConfidence && findings.length > 0;
+  return {
+    role,
+    status: valid ? "completed" : "invalid",
+    verdict: valid ? verdict : undefined,
+    summary: titleValue(value.summary, valid ? "审查完成。" : "审查结果缺少 verdict、confidence 或 findings。"),
+    findings,
+    requiredChanges: asStringArray(value.requiredChanges),
+    suggestions: asStringArray(value.suggestions),
+    riskLevel: enumValue(value.riskLevel, ["LOW", "MEDIUM", "HIGH"] as const, "MEDIUM"),
+    confidence: hasValidConfidence ? clampConfidence(value.confidence) : undefined
+  };
+}
+
+export function mergePrdReviewReviewer(existing: PrdReviewGateResult | undefined, reviewer: PrdReviewerResult, generatedAt = new Date().toISOString()) {
+  const reviewers = prdReviewerRoles.map((role) => {
+    if (role === reviewer.role) return reviewer;
+    return existing?.reviewers.find((item) => item.role === role) ?? normalizeReviewer(role, undefined);
+  });
+  return aggregatePrdReviewGate(reviewers, generatedAt);
+}
+
+export function aggregatePrdReviewGate(reviewers: PrdReviewerResult[], generatedAt = new Date().toISOString()): PrdReviewGateResult {
+  const reviewerStatuses = prdReviewerRoles.reduce((acc, role) => {
+    acc[role] = reviewers.find((reviewer) => reviewer.role === role)?.status ?? "missing";
+    return acc;
+  }, {} as Record<ReviewerRole, ReviewerStatus>);
+  const missingReviewers = prdReviewerRoles.filter((role) => reviewerStatuses[role] === "missing");
+  const failedReviewers = prdReviewerRoles.filter((role) => reviewerStatuses[role] === "failed" || reviewerStatuses[role] === "invalid");
+  const complete = prdReviewerRoles.every((role) => reviewerStatuses[role] === "completed");
+  const verdicts = reviewers.map((reviewer) => reviewer.verdict).filter(Boolean);
+  return {
+    status: complete ? "completed" : "incomplete",
+    reviewerStatuses,
+    reviewers,
+    missingReviewers,
+    failedReviewers,
+    gateDecision: complete
+      ? verdicts.includes("BLOCK") ? "BLOCK" : verdicts.includes("WARN") ? "WARN" : "PASS"
+      : undefined,
+    generatedAt
+  };
+}
+
+export function normalizePrdReviewGate(value: unknown, fallback?: PrdReviewGateResult): PrdReviewGateResult {
+  const record = isRecord(value) ? value : {};
+  const rawReviewers = Array.isArray(record.reviewers) ? record.reviewers : [];
+  const reviewers = prdReviewerRoles.map((role) => normalizeReviewer(role, rawReviewers.find((item) => isRecord(item) && item.role === role)));
+  if (reviewers.every((reviewer) => reviewer.status === "missing") && fallback) return fallback;
+  return aggregatePrdReviewGate(reviewers, titleValue(record.generatedAt, fallback?.generatedAt ?? new Date().toISOString()));
+}
+
+function mdList(items: string[]) {
+  return items.length ? items.map((item) => `- ${item}`).join("\n") : "- 暂无";
+}
+
+export function renderEvidencePdrsMarkdown(result: EvidenceBasedPdrsResult) {
+  const sections = evidencePdrsDimensionNames.map((name) => {
+    const dimension = result.dimensions[name];
+    return `## ${name}\n- 分数：${dimension.score}\n- 置信度：${Math.round(dimension.confidence * 100)}%\n- 原因：${dimension.reason}\n\n### Evidence\n${mdList(dimension.evidence)}\n\n### Risks\n${mdList(dimension.risks)}\n\n### Missing Evidence\n${mdList(dimension.missingEvidence)}`;
+  }).join("\n\n");
+  return `# Evidence-based PDRS\n\n- Overall Score：${result.overallScore}\n- Final Recommendation：${result.finalRecommendation}\n- Generated At：${result.generatedAt}\n\n${sections}\n`;
+}
+
+export function renderRoadmapMarkdown(result: RoadmapResult) {
+  const stages: RoadmapStage[] = ["NOW", "NEXT", "LATER"];
+  return `# Roadmap\n\n- Generated At：${result.generatedAt}\n\n${stages.map((stage) => {
+    const items = result.items.filter((item) => item.stage === stage);
+    return `## ${stage}\n\n${items.length ? items.map((item) => `### ${item.priority} · ${item.title}\n- 类型：${item.type}\n- 说明：${item.description}\n- 理由：${item.rationale}\n- 依赖：${item.dependencies.join("、") || "无"}\n- 风险：${item.risks.join("、") || "无"}\n- 估算：${item.estimatedEffort}\n\n#### Success Metrics\n${mdList(item.successMetrics)}\n\n#### Acceptance Criteria\n${mdList(item.acceptanceCriteria)}`).join("\n\n") : "暂无事项"}`;
+  }).join("\n\n")}\n`;
+}
+
+export function renderPrdReviewMarkdown(result: PrdReviewGateResult) {
+  const warning = result.status === "incomplete" ? "\n> Gate 未完成，不能作为 Codex Pack 交接依据。\n" : "";
+  const decision = result.gateDecision ? `- Gate Decision：${result.gateDecision}` : "- Gate Decision：未生成";
+  const reviewers = result.reviewers.map((reviewer) => `## ${reviewer.role}\n- 状态：${reviewer.status}\n- Verdict：${reviewer.verdict ?? "未生成"}\n- Risk Level：${reviewer.riskLevel}\n- Confidence：${reviewer.confidence === undefined ? "无效" : `${Math.round(reviewer.confidence * 100)}%`}\n- Summary：${reviewer.summary}\n\n### Findings\n${mdList(reviewer.findings)}\n\n### Required Changes\n${mdList(reviewer.requiredChanges)}\n\n### Suggestions\n${mdList(reviewer.suggestions)}`).join("\n\n");
+  return `# PRD Review Gate\n${warning}\n- Status：${result.status}\n${decision}\n- Missing Reviewers：${result.missingReviewers.join("、") || "无"}\n- Failed Reviewers：${result.failedReviewers.join("、") || "无"}\n- Generated At：${result.generatedAt}\n\n${reviewers}\n`;
+}
+
+async function persistGeneratedMarkdownPair(projectId: string, jsonType: string, jsonContent: string, markdownType: string, markdownContent: string) {
+  const [jsonArtifact, markdownArtifact] = await prisma.$transaction([
+    prisma.generatedArtifact.create({ data: { projectId, artifactType: jsonType, content: jsonContent } }),
+    prisma.generatedArtifact.create({ data: { projectId, artifactType: markdownType, content: markdownContent } })
+  ]);
+  await Promise.all([
+    putArtifact({ projectId, generatedArtifactId: jsonArtifact.id, artifactType: jsonType, filename: `${jsonType}.json`, content: jsonContent, mimeType: "application/json;charset=utf-8" }),
+    putArtifact({ projectId, generatedArtifactId: markdownArtifact.id, artifactType: markdownType, filename: markdownType, content: markdownContent, mimeType: "text/markdown;charset=utf-8" })
+  ]);
+  return { jsonArtifact, markdownArtifact };
 }
 
 async function invalidateProjectCache(projectId: string) {
@@ -402,9 +796,20 @@ function packModelConfig(project: ProjectArtifacts) {
   return {
     provider: config.provider,
     model: config.model,
-    usageMode: config.usageMode,
-    codexCliCommand: config.codexCliCommand ?? undefined
+    usageMode: "api"
   };
+}
+
+function supplementalCodexArtifacts(project: ProjectArtifacts): CodexPackFile[] {
+  const seen = new Set<string>();
+  return project.artifacts
+    .filter((artifact) => [evidencePdrsMarkdownArtifact, roadmapMarkdownArtifact, prdReviewMarkdownArtifact].includes(artifact.artifactType))
+    .filter((artifact) => {
+      if (seen.has(artifact.artifactType)) return false;
+      seen.add(artifact.artifactType);
+      return true;
+    })
+    .map((artifact) => ({ filename: artifact.artifactType, content: artifact.content }));
 }
 
 function toPackProject(project: PackProject & Partial<ProjectArtifacts>): PackProject {
@@ -422,7 +827,8 @@ function toPackProject(project: PackProject & Partial<ProjectArtifacts>): PackPr
       requirementDefinition: reportContext.coreFeatures.join("\n"),
       coreFeatures: reportContext.coreFeatures
     },
-    modelConfig: project.artifacts ? packModelConfig({ artifacts: project.artifacts }) : undefined
+    modelConfig: project.artifacts ? packModelConfig({ artifacts: project.artifacts }) : undefined,
+    supplementalArtifacts: project.artifacts ? supplementalCodexArtifacts({ artifacts: project.artifacts }) : undefined
   };
 }
 
@@ -452,7 +858,7 @@ function usageItems(
     name: item.name,
     path: item.path,
     purpose: item.purpose,
-    callCount: Number.isFinite(Number(item.callCount)) ? Math.max(0, Number(item.callCount)) : 0,
+    callCount: Number.isFinite(Number(item.callCount)) ? Math.max(0, Number(item.callCount)) : undefined,
     status: item.status === "used" || item.status === "planned" || item.status === "not_reported" ? item.status : "not_reported",
     reason: item.reason || fallbackReason
   }));
@@ -701,7 +1107,7 @@ export async function runProjectResearch(projectId: string) {
   }
 
   const run = await startProjectResearch(projectId);
-  const existingTask = await findActiveTask(projectId, researchTaskType);
+  const existingTask = await findActiveResearchTaskForRun(projectId, run.id);
   const task = existingTask ?? await enqueueTask({
     type: researchTaskType,
     projectId,
@@ -713,6 +1119,18 @@ export async function runProjectResearch(projectId: string) {
   if (acquired) await processResearchTaskById(task.id);
   await invalidateProjectCache(projectId);
   return prisma.researchRun.findUnique({ where: { id: run.id } });
+}
+
+async function findActiveResearchTaskForRun(projectId: string, researchRunId: string) {
+  return prisma.asyncTask.findFirst({
+    where: {
+      projectId,
+      type: researchTaskType,
+      status: { in: [...activeTaskStatuses] },
+      payloadJson: { contains: `"researchRunId":"${researchRunId}"` }
+    },
+    orderBy: [{ priority: "desc" }, { createdAt: "asc" }]
+  });
 }
 
 async function waitForActiveResearchRun(projectId: string) {
@@ -1096,6 +1514,170 @@ export async function evaluateProjectById(projectId: string): Promise<Evaluation
   await persistEvaluation(projectId, hermesEvaluation);
   await invalidateProjectCache(projectId);
   return hermesEvaluation;
+}
+
+function projectEvidenceBrief(project: ProjectWithFlowData, prd: string, research?: HermesResearchOutput, evaluation?: EvaluationResult) {
+  return JSON.stringify({
+    project: {
+      name: project.name,
+      idea: project.idea,
+      industry: project.industry,
+      targetUser: project.targetUser,
+      needFinancialSuitabilityCheck: project.needFinancialSuitabilityCheck,
+      preferredTechStack: project.preferredTechStack
+    },
+    reportAssistant: parseReportAssistantContext(project),
+    prd: prd.slice(0, 8000),
+    evaluation,
+    research: research ? {
+      competitors: research.competitors,
+      differentiation: research.differentiation,
+      monitorPlan: research.monitor_plan
+    } : undefined,
+    competitors: competitorMatrixForEvaluation(project)
+  }, null, 2);
+}
+
+export async function generateEvidenceBasedPdrs(projectId: string): Promise<EvidenceBasedPdrsResult> {
+  const project = await loadProjectFlowData(projectId);
+  const { evaluation, research, prd } = evaluateProjectFlow(project);
+  const fallback = fallbackEvidencePdrs(project, evaluation, prd, research);
+  const generated = await generateJsonWithModel({
+    config: modelConfigFromProject(project),
+    projectId,
+    system: "你是严谨的产品决策评估专家。只输出 JSON。不得编造证据；没有证据时必须写入 missingEvidence 并降低 confidence。",
+    user: `基于以下项目材料生成 Evidence-based PDRS。必须包含 dimensions 对象，维度为 ${evidencePdrsDimensionNames.join(", ")}。每个维度必须包含 score, reason, evidence, confidence, risks, missingEvidence。还必须包含 overallScore 和 finalRecommendation(GO/HOLD/PIVOT/KILL)。\n\n${projectEvidenceBrief(project, prd, research, evaluation)}`,
+    fallback
+  });
+  const result = normalizeEvidenceBasedPdrs(generated, fallback);
+  await persistGeneratedMarkdownPair(
+    projectId,
+    evidencePdrsArtifact,
+    JSON.stringify(result, null, 2),
+    evidencePdrsMarkdownArtifact,
+    renderEvidencePdrsMarkdown(result)
+  );
+  await invalidateProjectCache(projectId);
+  return result;
+}
+
+export async function generateRoadmap(projectId: string): Promise<RoadmapResult> {
+  const project = await loadProjectFlowData(projectId);
+  const { evaluation, research, prd } = evaluateProjectFlow(project);
+  const pdrs = parseLatestEvidencePdrs(project) ?? fallbackEvidencePdrs(project, evaluation, prd, research);
+  const fallback = fallbackRoadmap(project, prd, pdrs);
+  const generated = await generateJsonWithModel({
+    config: modelConfigFromProject(project),
+    projectId,
+    system: "你是资深产品交付负责人。只输出 JSON。不得把未验证内容写成已完成事实；依赖和风险必须显式标注。",
+    user: `基于项目上下文、PRD、Hermes 研究和 Evidence PDRS 生成 staged roadmap。输出 JSON 字段：generatedAt, items。每个 item 包含 title, description, stage(NOW/NEXT/LATER), priority(P0/P1/P2/P3), type(FEATURE/INFRA/RESEARCH/COMPLIANCE/UX/QA/OPS), rationale, dependencies, risks, estimatedEffort, successMetrics, acceptanceCriteria。\n\nEvidence PDRS:\n${JSON.stringify(pdrs, null, 2)}\n\nProject Context:\n${projectEvidenceBrief(project, prd, research, evaluation)}`,
+    fallback
+  });
+  const result = normalizeRoadmap(generated, fallback);
+  await persistGeneratedMarkdownPair(
+    projectId,
+    roadmapArtifact,
+    JSON.stringify(result, null, 2),
+    roadmapMarkdownArtifact,
+    renderRoadmapMarkdown(result)
+  );
+  await invalidateProjectCache(projectId);
+  return result;
+}
+
+async function runSinglePrdReviewerAttempt(project: ProjectWithFlowData, role: ReviewerRole, prd: string, context: string): Promise<PrdReviewerResult> {
+  if (!prd.trim()) {
+    return {
+      role,
+      status: "failed",
+      summary: "缺少 PRD，无法执行该角色审查。",
+      findings: [],
+      requiredChanges: [],
+      suggestions: [],
+      riskLevel: "HIGH"
+    };
+  }
+  const fallback = {
+    role,
+    status: "failed",
+    summary: "模型调用失败或未配置 API key，该角色审查未正常完成。",
+    findings: [],
+    requiredChanges: [],
+    suggestions: [],
+    riskLevel: "HIGH"
+  };
+  try {
+    const generated = await generateJsonWithModel({
+      config: modelConfigFromProject(project),
+      projectId: project.id,
+      system: "你是 PRD 审查专家。只输出 JSON。不得编造事实；证据不足时 verdict 应为 WARN 或 BLOCK，并在 requiredChanges 中写清必须补充项。",
+      user: `请以 ${role} 角色审查 PRD。\n角色职责：${prdReviewerRoleBriefs[role]}\n输出字段必须包含 role, verdict(PASS/WARN/BLOCK), summary, findings, requiredChanges, suggestions, riskLevel(LOW/MEDIUM/HIGH), confidence(0-1)。\n\n项目上下文：\n${context}`,
+      fallback
+    });
+    return normalizeReviewer(role, generated);
+  } catch (error) {
+    return {
+      role,
+      status: "failed",
+      summary: error instanceof Error ? error.message : "该角色审查执行失败。",
+      findings: [],
+      requiredChanges: [],
+      suggestions: [],
+      riskLevel: "HIGH"
+    };
+  }
+}
+
+async function runSinglePrdReviewer(project: ProjectWithFlowData, role: ReviewerRole, prd: string, context: string): Promise<PrdReviewerResult> {
+  if (!prd.trim()) return runSinglePrdReviewerAttempt(project, role, prd, context);
+
+  let latest: PrdReviewerResult | undefined;
+  for (let attempt = 1; attempt <= prdReviewerMaxAttempts; attempt += 1) {
+    latest = await runSinglePrdReviewerAttempt(project, role, prd, context);
+    if (latest.status === "completed") return latest;
+    const retryDelay = prdReviewerRetryDelayMs[attempt - 1];
+    if (retryDelay) await delay(retryDelay);
+  }
+
+  return latest
+    ? { ...latest, summary: `${latest.summary} 已执行 ${prdReviewerMaxAttempts} 次短重试，仍未获得合法审查输出。` }
+    : { role, status: "failed", summary: "该角色审查未产生结果。", findings: [], requiredChanges: [], suggestions: [], riskLevel: "HIGH" };
+}
+
+export async function runPrdReviewGate(projectId: string): Promise<PrdReviewGateResult> {
+  const project = await loadProjectFlowData(projectId);
+  const { evaluation, research, prd } = evaluateProjectFlow(project);
+  const context = projectEvidenceBrief(project, prd, research, evaluation);
+  const reviewers = await Promise.all(prdReviewerRoles.map((role) => runSinglePrdReviewer(project, role, prd, context)));
+  const result = aggregatePrdReviewGate(reviewers);
+  await persistGeneratedMarkdownPair(
+    projectId,
+    prdReviewGateArtifact,
+    JSON.stringify(result, null, 2),
+    prdReviewMarkdownArtifact,
+    renderPrdReviewMarkdown(result)
+  );
+  await invalidateProjectCache(projectId);
+  return result;
+}
+
+export async function regeneratePrdReviewGateReviewer(projectId: string, rawRole: string): Promise<PrdReviewGateResult> {
+  const role = reviewerRoleFromString(rawRole);
+  const project = await loadProjectFlowData(projectId);
+  const { evaluation, research, prd } = evaluateProjectFlow(project);
+  const context = projectEvidenceBrief(project, prd, research, evaluation);
+  const existing = parseLatestPrdReviewGate(project);
+  const reviewer = await runSinglePrdReviewer(project, role, prd, context);
+  const result = mergePrdReviewReviewer(existing, reviewer);
+  await persistGeneratedMarkdownPair(
+    projectId,
+    prdReviewGateArtifact,
+    JSON.stringify(result, null, 2),
+    prdReviewMarkdownArtifact,
+    renderPrdReviewMarkdown(result)
+  );
+  await invalidateProjectCache(projectId);
+  return result;
 }
 
 export async function exportProjectCodexPack(projectId: string): Promise<CodexPackFile[]> {

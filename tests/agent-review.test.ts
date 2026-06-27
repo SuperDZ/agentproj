@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { evaluateGatePolicy, maxDecision } from "@/lib/agents/gate-policy";
 import { agentKeysForMode, agentRegistry } from "@/lib/agents/registry";
 import { createAgentReviewSchema } from "@/lib/agents/schemas";
+import { normalizeAgentOutputForReview } from "@/lib/agents/runtime";
 
 describe("agent review gate policy", () => {
   it("blocks when a critical consensus finding is open", () => {
@@ -74,5 +75,58 @@ describe("agent review request schema", () => {
     });
 
     expect(parsed).toMatchObject({ targetType: "codex_pack", mode: "default", force: true });
+  });
+});
+
+describe("agent review output normalization", () => {
+  it("normalizes model confidence and missing dedupe keys before schema validation", () => {
+    const output = normalizeAgentOutputForReview({
+      summary: "Needs changes.",
+      decisionSuggestion: "warn",
+      findings: [
+        {
+          severity: "major",
+          category: "product",
+          title: "Clarify scope",
+          description: "The scope is ambiguous.",
+          confidence: 85,
+          evidence: [{ sourceType: "prd", quote: "TBD" }]
+        },
+        {
+          severity: "high",
+          category: "unknown",
+          title: "Add tests",
+          description: "Test coverage is underspecified.",
+          confidence: "62%"
+        }
+      ]
+    }, "product-agent");
+
+    expect(output.decisionSuggestion).toBe("pass");
+    expect(output.findings[0]).toMatchObject({
+      severity: "medium",
+      category: "product",
+      confidence: 0.85,
+      dedupeKey: "product-clarify-scope"
+    });
+    expect(output.findings[1]).toMatchObject({
+      severity: "high",
+      category: "engineering",
+      confidence: 0.62,
+      dedupeKey: "engineering-add-tests"
+    });
+  });
+
+  it("uses a caller-provided fallback for missing synthesizer fields", () => {
+    const output = normalizeAgentOutputForReview({}, "synthesizer-agent", {
+      summary: "Rule blocked the review because a critical finding is open.",
+      decisionSuggestion: "blocked",
+      findings: []
+    });
+
+    expect(output).toMatchObject({
+      summary: "Rule blocked the review because a critical finding is open.",
+      decisionSuggestion: "blocked"
+    });
   });
 });

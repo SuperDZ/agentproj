@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { defaultModelForProvider } from "@/lib/model/providers";
 import { getHermesStatus, restartHermesDashboard, saveModelConfig, startHermesDashboard, stopHermesDashboard } from "@/lib/hermes/control";
 
 export async function GET() {
@@ -18,11 +19,10 @@ export async function POST(request: Request) {
     if (action === "stop") return NextResponse.json(await stopHermesDashboard());
     if (action === "restart") return NextResponse.json(await restartHermesDashboard());
     if (action === "configure-model") {
+      const provider = String(body.provider || "deepseek");
       return NextResponse.json(await saveModelConfig({
-        provider: String(body.provider || "deepseek"),
-        model: String(body.model || "deepseek-chat"),
-        usageMode: String(body.usageMode || "api"),
-        codexCliCommand: String(body.codexCliCommand || "codex")
+        provider,
+        model: String(body.model || defaultModelForProvider(provider))
       }));
     }
   } catch (error) {

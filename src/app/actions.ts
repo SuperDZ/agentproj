@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { prisma } from "@/lib/db/prisma";
 import { deleteProjectStoredArtifacts } from "@/lib/artifacts/store";
+import { ensureLocalHermesDashboardRunning } from "@/lib/hermes/control";
 import { demoIdea } from "@/lib/mock/demo";
 import { createProjectSchema, projectNameFromIdea } from "@/lib/project-schema";
 import {
@@ -11,9 +12,12 @@ import {
   createProjectSkillToolRecommendations,
   evaluateProjectById,
   exportProjectCodexPack,
+  generateEvidenceBasedPdrs,
   generateInitialProjectPlanningWithHermes,
   generateProjectPrd,
+  generateRoadmap,
   generateTechStackRecommendations,
+  runPrdReviewGate,
   runProjectResearch,
   saveProjectPrd,
   saveReportAssistantContext,
@@ -32,10 +36,10 @@ export async function createProject(formData: FormData) {
     monitorTasks: formData.get("monitorTasks") || undefined,
     monitorTaskConfigs: formData.get("monitorTaskConfigs") || undefined,
     modelProvider: formData.get("modelProvider") || undefined,
-    modelName: formData.get("modelName") || undefined,
-    modelUsageMode: formData.get("modelUsageMode") || undefined,
-    codexCliCommand: formData.get("codexCliCommand") || undefined
+    modelName: formData.get("modelName") || undefined
   });
+
+  await ensureLocalHermesDashboardRunning();
 
   const project = await prisma.project.create({
     data: {
@@ -72,6 +76,7 @@ export async function createProject(formData: FormData) {
 }
 
 export async function createDemoProject() {
+  await ensureLocalHermesDashboardRunning();
   const project = await prisma.project.create({ data: { ...demoIdea, status: "demo" } });
   await createProjectSkillToolRecommendations(project.id);
   await generateInitialProjectPlanningWithHermes(project.id);
@@ -144,6 +149,21 @@ export async function selectTechStack(projectId: string, formData: FormData) {
 
 export async function evaluateCurrentProject(projectId: string) {
   await evaluateProjectById(projectId);
+  revalidatePath(`/projects/${projectId}`);
+}
+
+export async function generateEvidencePdrsAction(projectId: string) {
+  await generateEvidenceBasedPdrs(projectId);
+  revalidatePath(`/projects/${projectId}`);
+}
+
+export async function generateRoadmapAction(projectId: string) {
+  await generateRoadmap(projectId);
+  revalidatePath(`/projects/${projectId}`);
+}
+
+export async function runPrdReviewGateAction(projectId: string) {
+  await runPrdReviewGate(projectId);
   revalidatePath(`/projects/${projectId}`);
 }
 

@@ -1,6 +1,8 @@
 import type { EvaluationResult } from "@/lib/evaluation/engine";
 import type { HermesResearchOutput } from "@/lib/hermes/types";
 
+export type CodexPackFile = { filename: string; content: string };
+
 export type PackProject = {
   name: string;
   idea: string;
@@ -18,11 +20,9 @@ export type PackProject = {
     provider?: string;
     model?: string;
     usageMode?: string;
-    codexCliCommand?: string;
   };
+  supplementalArtifacts?: CodexPackFile[];
 };
-
-export type CodexPackFile = { filename: string; content: string };
 
 function list(items: string[]) {
   return items.map((item) => `- ${item}`).join("\n");
@@ -59,8 +59,7 @@ function interviewContextMarkdown(project: PackProject) {
 function modelConfigLine(project: PackProject) {
   const config = project.modelConfig;
   if (!config?.provider && !config?.model) return "默认项目模型配置。";
-  const command = config.usageMode === "codex-cli" ? `，CLI：${config.codexCliCommand || "codex"}` : "";
-  return `${config.provider || "unknown"} / ${config.model || "default"} / ${config.usageMode || "api"}${command}`;
+  return `${config.provider || "unknown"} / ${config.model || "default"} / api`;
 }
 
 function escapeXml(value: string) {
@@ -381,7 +380,7 @@ ${tasks}
 - 原始模型输出必须持久化用于审计。`;
 
   const readme = `# ${project.name}\n\n${project.idea}\n\n## 面试交付物\n- 90 分钟运行手册\n- PRD（产品需求文档）\n- 原型规格\n- 路演大纲\n- Vibe Coding（氛围式编码）实施计划\n- Codex（编码代理）就绪任务包\n`;
-  return [
+  const files = [
     { filename: "README.md", content: readme },
     { filename: "PRD.md", content: prd },
     { filename: "interview_runbook.md", content: generateInterviewRunbook(project, research) },
@@ -397,6 +396,7 @@ ${tasks}
     { filename: "tool_skill_plan.md", content: generateToolSkillPlan() },
     { filename: "monitor_plan.md", content: generateMonitorPlan(project, research) }
   ];
+  return [...files, ...(project.supplementalArtifacts ?? [])];
 }
 
 export function packToClipboardText(files: CodexPackFile[]) {

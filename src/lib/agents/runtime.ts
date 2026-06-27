@@ -8,7 +8,14 @@ import { generateJsonWithModel } from "@/lib/model/client";
 import { finishSpan, logEvent, startSpan } from "@/lib/observability";
 import { hydrateAgentContext, loadAgentReviewSnapshot } from "@/lib/agents/context-snapshot";
 import { getAgentDefinition } from "@/lib/agents/registry";
-import { agentOutputSchema, type AgentFindingInput, type AgentOutput } from "@/lib/agents/schemas";
+import {
+  agentDecisions,
+  agentOutputSchema,
+  findingCategories,
+  findingSeverities,
+  type AgentFindingInput,
+  type AgentOutput
+} from "@/lib/agents/schemas";
 
 const severityLimits: Record<string, number> = {
   critical: 1,
@@ -38,6 +45,61 @@ function fallbackOutput(agentKey: string): AgentOutput {
     summary: `${agentKey} completed without model-generated findings.`,
     decisionSuggestion: "pass",
     findings: []
+  };
+}
+
+function stringFromUnknown(value: unknown, fallback: string) {
+  return typeof value === "string" && value.trim() ? value.trim() : fallback;
+}
+
+function normalizeConfidence(value: unknown) {
+  const raw = typeof value === "string" ? Number(value.trim().replace(/%$/, "")) : value;
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return undefined;
+  const normalized = raw > 1 ? raw / 100 : raw;
+  return Math.max(0, Math.min(1, normalized));
+}
+
+function normalizeEvidence(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.map((item, index) => {
+    const record = typeof item === "object" && item ? item as Record<string, unknown> : {};
+    return {
+      sourceType: stringFromUnknown(record.sourceType, `source-${index + 1}`),
+      sourceId: typeof record.sourceId === "string" ? record.sourceId : undefined,
+      quote: typeof record.quote === "string" ? record.quote : undefined
+    };
+  });
+}
+
+function normalizeFinding(value: unknown, index: number): AgentFindingInput {
+  const record = typeof value === "object" && value ? value as Record<string, unknown> : {};
+  const severity = findingSeverities.includes(record.severity as never) ? record.severity as AgentFindingInput["severity"] : "medium";
+  const category = findingCategories.includes(record.category as never) ? record.category as AgentFindingInput["category"] : "engineering";
+  const title = stringFromUnknown(record.title, `Finding ${index + 1}`).slice(0, 180);
+  return {
+    severity,
+    category,
+    title,
+    description: stringFromUnknown(record.description, title).slice(0, 3000),
+    evidence: normalizeEvidence(record.evidence),
+    recommendation: typeof record.recommendation === "string" ? record.recommendation.slice(0, 3000) : undefined,
+    confidence: normalizeConfidence(record.confidence),
+    dedupeKey: normalizeDedupeKey(stringFromUnknown(record.dedupeKey, `${category}-${title}`))
+  };
+}
+
+export function normalizeAgentOutputForReview(value: unknown, agentKey: string, fallbackOverride?: AgentOutput): AgentOutput {
+  const fallback = fallbackOverride ?? fallbackOutput(agentKey);
+  const record = typeof value === "object" && value ? value as Record<string, unknown> : {};
+  const decisionSuggestion = agentDecisions.includes(record.decisionSuggestion as never)
+    ? record.decisionSuggestion as AgentOutput["decisionSuggestion"]
+    : fallback.decisionSuggestion;
+  return {
+    summary: stringFromUnknown(record.summary, fallback.summary).slice(0, 5000),
+    decisionSuggestion,
+    findings: Array.isArray(record.findings)
+      ? record.findings.map((finding, index) => normalizeFinding(finding, index))
+      : []
   };
 }
 
@@ -78,7 +140,7 @@ async function generateAgentOutput(input: {
     projectId: input.projectId,
     traceId: input.traceId
   });
-  return agentOutputSchema.parse(generated);
+  return agentOutputSchema.parse(normalizeAgentOutputForReview(generated, input.agentKey));
 }
 
 export async function executeAgentRun(input: {
