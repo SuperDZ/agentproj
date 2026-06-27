@@ -16,6 +16,11 @@ function localHermesTimeoutMs() {
   return Number.isFinite(value) && value > 0 ? value : 180_000;
 }
 
+function localHermesLogDeltaMaxBytes() {
+  const value = Number(process.env.HERMES_AGENT_LOG_DELTA_MAX_BYTES ?? 512 * 1024);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 512 * 1024;
+}
+
 function localHermesProvider(config: HermesModelConfig) {
   return config.provider || process.env.HERMES_LOCAL_PROVIDER || process.env.HERMES_INFERENCE_PROVIDER;
 }
@@ -79,9 +84,11 @@ async function readAgentLogDelta(snapshot: LocalUsageSnapshot) {
     try {
       const stat = await handle.stat();
       if (stat.size <= snapshot.agentLogSize) return "";
-      const length = stat.size - snapshot.agentLogSize;
+      const growth = stat.size - snapshot.agentLogSize;
+      const length = Math.min(growth, localHermesLogDeltaMaxBytes());
+      const position = stat.size - length;
       const buffer = Buffer.alloc(length);
-      await handle.read(buffer, 0, length, snapshot.agentLogSize);
+      await handle.read(buffer, 0, length, position);
       return buffer.toString("utf8");
     } finally {
       await handle.close();

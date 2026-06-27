@@ -79,7 +79,14 @@ export async function redisSetNumber(key: string, value: number, ttlSeconds = de
 }
 
 export async function redisDecrement(key: string) {
-  return withRedis<number | null>(async (client) => client.decr(key), null);
+  return withRedis<number | null>(async (client) => {
+    const result = await client.eval(
+      "if redis.call('EXISTS', KEYS[1]) == 1 then return redis.call('DECR', KEYS[1]) else return nil end",
+      1,
+      key
+    );
+    return typeof result === "number" ? result : null;
+  }, null);
 }
 
 export async function acquireIdempotencyKey(key: string, ttlSeconds = 30) {
