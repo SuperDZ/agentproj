@@ -28,13 +28,14 @@ function normalizeDedupeKey(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 180) || "finding";
 }
 
-function capFindings(findings: AgentFindingInput[]) {
+function capFindings(findings: AgentFindingInput[]): AgentFindingInput[] {
   const counts: Record<string, number> = {};
   return findings.map((finding) => {
     const severity = finding.severity;
     counts[severity] = (counts[severity] ?? 0) + 1;
     if (severity in severityLimits && counts[severity] > severityLimits[severity]) {
-      return { ...finding, severity: severity === "critical" || severity === "high" ? "medium" : "low" };
+      const cappedSeverity: AgentFindingInput["severity"] = severity === "critical" || severity === "high" ? "medium" : "low";
+      return { ...finding, severity: cappedSeverity };
     }
     return finding;
   });
@@ -262,6 +263,7 @@ export async function executeAgentRun(input: {
       ...finding,
       dedupeKey: normalizeDedupeKey(finding.dedupeKey || `${finding.category}-${finding.title}`)
     }));
+    const persistedOutput: AgentOutput = { ...output, findings: normalizedFindings };
     if (await reviewIsInactive(review.id)) {
       await finishSpan(span, { status: "cancelled", attributes: { reason: "inactive_review_before_persist" } });
       return { reviewId: review.id, agentRunId: run.id, status: "cancelled" };
@@ -274,7 +276,7 @@ export async function executeAgentRun(input: {
       projectId: review.projectId,
       artifactType: "agent-run-output",
       filename: `agent-run-${run.id}.json`,
-      content: JSON.stringify({ ...output, findings: normalizedFindings }, null, 2),
+      content: JSON.stringify(persistedOutput, null, 2),
       mimeType: "application/json;charset=utf-8"
     });
     if (await reviewIsInactive(review.id)) {
@@ -287,7 +289,7 @@ export async function executeAgentRun(input: {
         where: { id: run.id, status: { notIn: [...terminalAgentRunStatuses] } },
         data: {
           status: "succeeded",
-          outputJson: output,
+          outputJson: persistedOutput,
           outputArtifactId: storedOutput.id,
           endedAt: new Date(),
           durationMs: Math.max(0, Date.now() - startedAt.getTime())
